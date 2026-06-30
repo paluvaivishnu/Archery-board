@@ -1,0 +1,14 @@
+path: datasets/fulltargethole.yolov11
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 2
+names: ['hole', 'target']
+
+roboflow:
+  workspace: vishnus-workspace-wetuu
+  project: fulltargethole-8bgnt
+  version: dataset
+  license: CC BY 4.0
+  url: https://app.roboflow.com/vishnus-workspace-wetuu/fulltargethole-8bgnt/dataset

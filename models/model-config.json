@@ -1,0 +1,16 @@
+{
+  "name": "Custom Trained YOLOv11m Detector",
+  "modelPath": "models/best.onnx",
+  "inputSize": 640,
+  "inputName": "auto",
+  "classes": [
+    "hit",
+    "inner_target",
+    "outer_target"
+  ],
+  "classDisplayNames": {
+    "hit": "Hit (Hole)",
+    "inner_target": "Inner Target",
+    "outer_target": "Outer Target"
+  }
+}

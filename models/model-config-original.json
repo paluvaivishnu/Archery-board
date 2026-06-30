@@ -1,0 +1,14 @@
+{
+  "name": "Roboflow Full Target Hole Detector",
+  "modelPath": "models/yolov11m.onnx",
+  "inputSize": 640,
+  "inputName": "auto",
+  "classes": [
+    "hole",
+    "target"
+  ],
+  "classDisplayNames": {
+    "hole": "Hole",
+    "target": "Target"
+  }
+}
