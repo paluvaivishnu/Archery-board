@@ -252,7 +252,7 @@ class BullseyeApp {
         let center = { x: 450, y: 450 };
         const dx = x - center.x;
         const dy = y - center.y;
-        const distPx = Math.sqrt(dx*dx + dy*dy);
+        const distPx = Math.sqrt(Math.pow(dx, 2) + Math.pow(dy, 2));
 
         // Handle line cutter rules
         let scoringDistance = distPx;
@@ -260,21 +260,10 @@ class BullseyeApp {
             scoringDistance = Math.max(0, distPx - this.projectileRadius);
         }
 
-        // Determine score
+        // Determine score using Euclidean distance logic
         let score = 0;
         if (scoringDistance <= 440) {
-            if (scoringDistance <= 40) {
-                // 10-ring decimal score
-                const fraction = 1.0 - (scoringDistance / 40);
-                score = 10.0 + fraction;
-            } else {
-                // Outer rings scores
-                const ringNumber = Math.floor(scoringDistance / 40); // 1 to 10
-                const ringInnerLimit = (ringNumber + 1) * 40;
-                const distanceInRing = ringInnerLimit - scoringDistance;
-                const fraction = distanceInRing / 40;
-                score = (10 - ringNumber) + fraction;
-            }
+            score = 11 - (scoringDistance / 40);
         }
 
         // Restrict bounds

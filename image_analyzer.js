@@ -60,6 +60,7 @@ class TargetImageAnalyzer {
         this.activePin = null;
         this.pinRadius = 15;
         this.isCalibrating = false;
+        this.isSetCenterMode = false;
 
         // Replay sequence state
         this.replayInterval = null;
@@ -892,6 +893,461 @@ y2: ${cand.y2.toFixed(2)}`);
         return M_inv;
     }
 
+    // ==========================================================
+    // FIX 1 — ROBUST BULL'S-EYE CENTER DETECTION VIA HOUGH CIRCLES
+    // Replaces the fragile contour-centroid approach that would fall back
+    // to hardcoded (250,250) whenever the bull's-eye wasn't perfectly centred.
+    // ==========================================================
+    detectTargetCenterHough() {
+        if (!this.warpedMat || this.warpedMat.empty()) {
+            return { x: 250, y: 250, valid: false };
+        }
+
+        let gray    = new cv.Mat();
+        let blurred = new cv.Mat();
+        let circles = new cv.Mat();
+
+        try {
+            cv.cvtColor(this.warpedMat, gray, cv.COLOR_RGBA2GRAY);
+            cv.GaussianBlur(gray, blurred, new cv.Size(9, 9), 2);
+
+            // Search for circles across a wide radius range in the 900×900 warped image.
+            // dp=1, minDist=20, param1=100 (Canny high), param2=25 (accumulator threshold — low to catch many rings)
+            cv.HoughCircles(blurred, circles, cv.HOUGH_GRADIENT, 1, 20, 100, 25, 15, 440);
+
+            if (circles.cols > 0) {
+                // Collect centres that lie within 120px of the image mid-point (450,450)
+                let sumX = 0, sumY = 0, count = 0;
+                for (let i = 0; i < circles.cols; i++) {
+                    const cx = circles.data32F[i * 3];
+                    const cy = circles.data32F[i * 3 + 1];
+                    const distFromMid = Math.sqrt((cx - 450) ** 2 + (cy - 450) ** 2);
+                    if (distFromMid < 120) {
+                        sumX += cx;
+                        sumY += cy;
+                        count++;
+                    }
+                }
+
+                if (count > 0) {
+                    // Convert from 900-space → 500-space (scoring coordinate system)
+                    const detectedX = (sumX / count) / 1.8;
+                    const detectedY = (sumY / count) / 1.8;
+                    console.log(`[CenterDetect] HoughCircles found center at (${detectedX.toFixed(1)}, ${detectedY.toFixed(1)}) from ${count} circles`);
+                    return { x: detectedX, y: detectedY, valid: true };
+                }
+            }
+
+            console.warn('[CenterDetect] HoughCircles found no concentric rings — falling back to (250,250)');
+            return { x: 250, y: 250, valid: false };
+        } catch (e) {
+            console.warn('[CenterDetect] HoughCircles error:', e);
+            return { x: 250, y: 250, valid: false };
+        } finally {
+            gray.delete();
+            blurred.delete();
+            circles.delete();
+        }
+    }
+
+    // ==========================================================
+    // MULTI-STRATEGY TARGET CENTER DETECTION & REFINEMENT
+    // ==========================================================
+
+    detectCenterByConcentricEllipses() {
+        if (!this.warpedMat || this.warpedMat.empty()) {
+            return { x: 250, y: 250, valid: false };
+        }
+
+        let gray = new cv.Mat();
+        let blurred = new cv.Mat();
+        let edges = new cv.Mat();
+        let contours = new cv.MatVector();
+        let hierarchy = new cv.Mat();
+
+        try {
+            cv.cvtColor(this.warpedMat, gray, cv.COLOR_RGBA2GRAY);
+            cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+            cv.Canny(blurred, edges, 50, 150, 3, false);
+            cv.findContours(edges, contours, hierarchy, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
+
+            let ellipseCenters = [];
+            for (let i = 0; i < contours.size(); i++) {
+                let contour = contours.get(i);
+                if (contour.rows >= 5) {
+                    let area = cv.contourArea(contour);
+                    let perimeter = cv.arcLength(contour, true);
+                    if (perimeter > 0) {
+                        let circularity = 4 * Math.PI * area / (perimeter * perimeter);
+                        if (circularity > 0.4 && area > 200) {
+                            try {
+                                let rotatedRect = cv.fitEllipse(contour);
+                                ellipseCenters.push({
+                                    x: rotatedRect.center.x / 1.8,
+                                    y: rotatedRect.center.y / 1.8,
+                                    width: rotatedRect.size.width / 1.8,
+                                    height: rotatedRect.size.height / 1.8,
+                                    angle: rotatedRect.angle
+                                });
+                            } catch (err) {
+                                // fitEllipse can occasionally fail/throw
+                            }
+                        }
+                    }
+                }
+                contour.delete();
+            }
+
+            if (ellipseCenters.length >= 2) {
+                let bestCluster = [];
+                for (let i = 0; i < ellipseCenters.length; i++) {
+                    let cluster = [ellipseCenters[i]];
+                    for (let j = 0; j < ellipseCenters.length; j++) {
+                        if (i === j) continue;
+                        let dx = ellipseCenters[i].x - ellipseCenters[j].x;
+                        let dy = ellipseCenters[i].y - ellipseCenters[j].y;
+                        let dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist < 15) {
+                            cluster.push(ellipseCenters[j]);
+                        }
+                    }
+                    if (cluster.length > bestCluster.length) {
+                        bestCluster = cluster;
+                    }
+                }
+
+                if (bestCluster.length >= 2) {
+                    bestCluster.sort((a, b) => a.x - b.x);
+                    let medianX = bestCluster[Math.floor(bestCluster.length / 2)].x;
+                    bestCluster.sort((a, b) => a.y - b.y);
+                    let medianY = bestCluster[Math.floor(bestCluster.length / 2)].y;
+
+                    console.log(`[CenterDetect] Concentric ellipses found center at (${medianX.toFixed(1)}, ${medianY.toFixed(1)}) from cluster of ${bestCluster.length} ellipses`);
+                    return { x: medianX, y: medianY, valid: true, confidence: bestCluster.length };
+                }
+            }
+
+            return { x: 250, y: 250, valid: false };
+        } catch (e) {
+            console.warn('[CenterDetect] Concentric ellipses error:', e);
+            return { x: 250, y: 250, valid: false };
+        } finally {
+            gray.delete();
+            blurred.delete();
+            edges.delete();
+            contours.delete();
+            hierarchy.delete();
+        }
+    }
+
+    detectCenterByYellowRefinement() {
+        if (!this.warpedMat || this.warpedMat.empty()) {
+            return { x: 250, y: 250, valid: false };
+        }
+
+        let hsv = new cv.Mat();
+        let mask = new cv.Mat();
+        let rgb = new cv.Mat();
+        let contours = new cv.MatVector();
+        let hierarchy = new cv.Mat();
+
+        try {
+            cv.cvtColor(this.warpedMat, rgb, cv.COLOR_RGBA2RGB);
+            cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+
+            // Yellow HSV range
+            let low = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [15, 40, 100, 0]);
+            let high = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [35, 255, 255, 255]);
+            cv.inRange(hsv, low, high, mask);
+
+            let kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(9, 9));
+            cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
+            kernel.delete();
+
+            cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+            let largestArea = 0;
+            let bestContour = null;
+
+            for (let i = 0; i < contours.size(); i++) {
+                let contour = contours.get(i);
+                let area = cv.contourArea(contour);
+                if (area > largestArea) {
+                    largestArea = area;
+                    bestContour = contour;
+                }
+            }
+
+            if (bestContour && largestArea > 200) {
+                let M = cv.moments(bestContour, false);
+                if (M.m00 !== 0) {
+                    let cx = M.m10 / M.m00;
+                    let cy = M.m01 / M.m00;
+                    let cx500 = cx / 1.8;
+                    let cy500 = cy / 1.8;
+                    console.log(`[CenterDetect] Yellow refinement found center at (${cx500.toFixed(1)}, ${cy500.toFixed(1)})`);
+                    
+                    low.delete();
+                    high.delete();
+                    return { x: cx500, y: cy500, valid: true };
+                }
+            }
+
+            low.delete();
+            high.delete();
+            return { x: 250, y: 250, valid: false };
+        } catch (e) {
+            console.warn('[CenterDetect] Yellow refinement error:', e);
+            return { x: 250, y: 250, valid: false };
+        } finally {
+            hsv.delete();
+            mask.delete();
+            rgb.delete();
+            contours.delete();
+            hierarchy.delete();
+        }
+    }
+
+    detectCenterMultiStrategy() {
+        let ellipseResult = this.detectCenterByConcentricEllipses();
+        let yellowResult = this.detectCenterByYellowRefinement();
+
+        if (ellipseResult.valid && yellowResult.valid) {
+            let dx = ellipseResult.x - yellowResult.x;
+            let dy = ellipseResult.y - yellowResult.y;
+            let dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < 10) {
+                console.log(`[CenterDetect] MultiStrategy: Ellipse & Yellow agree (dist=${dist.toFixed(1)}px). Preferring yellow: (${yellowResult.x.toFixed(1)}, ${yellowResult.y.toFixed(1)})`);
+                return { x: yellowResult.x, y: yellowResult.y, valid: true, _autoDetected: true };
+            } else {
+                console.log(`[CenterDetect] MultiStrategy: Ellipse & Yellow disagree (dist=${dist.toFixed(1)}px). Preferring ellipse: (${ellipseResult.x.toFixed(1)}, ${ellipseResult.y.toFixed(1)})`);
+                return { x: ellipseResult.x, y: ellipseResult.y, valid: true, _autoDetected: true };
+            }
+        }
+
+        if (ellipseResult.valid) {
+            console.log(`[CenterDetect] MultiStrategy: Using ellipse center: (${ellipseResult.x.toFixed(1)}, ${ellipseResult.y.toFixed(1)})`);
+            return { x: ellipseResult.x, y: ellipseResult.y, valid: true, _autoDetected: true };
+        }
+
+        if (yellowResult.valid) {
+            console.log(`[CenterDetect] MultiStrategy: Using yellow center: (${yellowResult.x.toFixed(1)}, ${yellowResult.y.toFixed(1)})`);
+            return { x: yellowResult.x, y: yellowResult.y, valid: true, _autoDetected: true };
+        }
+
+        let houghResult = this.detectTargetCenterHough();
+        if (houghResult.valid) {
+            console.log(`[CenterDetect] MultiStrategy: Using Hough circles center: (${houghResult.x.toFixed(1)}, ${houghResult.y.toFixed(1)})`);
+            return { x: houghResult.x, y: houghResult.y, valid: true, _autoDetected: true };
+        }
+
+        console.warn(`[CenterDetect] MultiStrategy: All automatic strategies failed. Falling back to default (250, 250)`);
+        return { x: 250, y: 250, valid: false, _autoDetected: true };
+    }
+
+    detectRingBoundariesRadial(center) {
+        if (!this.warpedMat || this.warpedMat.empty()) {
+            return [];
+        }
+
+        const template = this.getTargetTemplateDetails(this.currentSession.targetType);
+        const ringCount = template.ringCount || 10;
+        
+        const cx900 = center.x * 1.8;
+        const cy900 = center.y * 1.8;
+        
+        const width = this.warpedMat.cols;
+        const height = this.warpedMat.rows;
+        const data = this.warpedMat.data;
+        
+        const numRays = 36;
+        const maxDist = 400;
+        
+        const profiles = Array.from({ length: numRays }, () => new Float32Array(maxDist));
+        
+        for (let ray = 0; ray < numRays; ray++) {
+            const angle = (ray * 10) * Math.PI / 180;
+            const cosA = Math.cos(angle);
+            const sinA = Math.sin(angle);
+            
+            for (let d = 0; d < maxDist; d++) {
+                const px = Math.round(cx900 + d * cosA);
+                const py = Math.round(cy900 + d * sinA);
+                
+                if (px >= 0 && px < width && py >= 0 && py < height) {
+                    const idx = (py * width + px) * 4;
+                    const r = data[idx];
+                    const g = data[idx + 1];
+                    const b = data[idx + 2];
+                    profiles[ray][d] = 0.299 * r + 0.587 * g + 0.114 * b;
+                } else {
+                    profiles[ray][d] = d > 0 ? profiles[ray][d - 1] : 128;
+                }
+            }
+        }
+        
+        const avgProfile = new Float32Array(maxDist);
+        for (let d = 0; d < maxDist; d++) {
+            let sum = 0;
+            for (let ray = 0; ray < numRays; ray++) {
+                sum += profiles[ray][d];
+            }
+            avgProfile[d] = sum / numRays;
+        }
+        
+        const smoothed = new Float32Array(maxDist);
+        for (let d = 0; d < maxDist; d++) {
+            let sum = 0;
+            let count = 0;
+            for (let k = -2; k <= 2; k++) {
+                const idx = d + k;
+                if (idx >= 0 && idx < maxDist) {
+                    sum += avgProfile[idx];
+                    count++;
+                }
+            }
+            smoothed[d] = sum / count;
+        }
+        
+        const gradient = new Float32Array(maxDist - 1);
+        for (let d = 0; d < maxDist - 1; d++) {
+            gradient[d] = Math.abs(smoothed[d + 1] - smoothed[d]);
+        }
+        
+        const peaks = [];
+        const minPeakSpacing = 15;
+        const peakThreshold = 1.5;
+        
+        for (let d = 1; d < maxDist - 2; d++) {
+            const val = gradient[d];
+            if (val > peakThreshold && val > gradient[d - 1] && val > gradient[d + 1]) {
+                if (peaks.length === 0 || d - peaks[peaks.length - 1] >= minPeakSpacing) {
+                    peaks.push(d);
+                } else if (val > gradient[peaks[peaks.length - 1]]) {
+                    peaks[peaks.length - 1] = d;
+                }
+            }
+        }
+        
+        let detectedRadii = peaks.map(p => p / 1.8);
+        detectedRadii.sort((a, b) => a - b);
+        detectedRadii = detectedRadii.filter(r => r > 5 && r < 245);
+        
+        console.log(`[RadialRings] Found ${detectedRadii.length} ring boundaries via radial intensity sampling:`, 
+                    detectedRadii.map(r => r.toFixed(1)));
+        
+        return detectedRadii;
+    }
+
+    alignAndSmoothRadii(detectedRadii, template) {
+        const ringCount = template.ringCount || 10;
+        const defaultSpacing = 250.0 / ringCount;
+        let expectedRadii = [];
+        for (let i = 1; i <= ringCount; i++) {
+            expectedRadii.push(i * defaultSpacing);
+        }
+
+        if (!detectedRadii || detectedRadii.length < 2) {
+            return expectedRadii;
+        }
+
+        detectedRadii.sort((a, b) => a - b);
+
+        let spacings = [];
+        for (let i = 1; i < detectedRadii.length; i++) {
+            spacings.push(detectedRadii[i] - detectedRadii[i - 1]);
+        }
+        
+        spacings = spacings.filter(s => s > 10 && s < 60);
+        if (spacings.length === 0) {
+            return expectedRadii;
+        }
+        
+        spacings.sort((a, b) => a - b);
+        let medianSpacing = spacings[Math.floor(spacings.length / 2)];
+
+        let finalRadii = [];
+        for (let i = 1; i <= ringCount; i++) {
+            let expectedRadius = i * medianSpacing;
+            let closest = detectedRadii.reduce((prev, curr) => 
+                Math.abs(curr - expectedRadius) < Math.abs(prev - expectedRadius) ? curr : prev
+            );
+            
+            if (Math.abs(closest - expectedRadius) < medianSpacing * 0.4) {
+                finalRadii.push(closest);
+            } else {
+                if (finalRadii.length > 0) {
+                    finalRadii.push(finalRadii[finalRadii.length - 1] + medianSpacing);
+                } else {
+                    finalRadii.push(expectedRadius);
+                }
+            }
+        }
+        return finalRadii;
+    }
+
+
+    // ==========================================================
+    // FIX 2 — CALIBRATE pixelsPerMm FROM ACTUALLY-DETECTED RINGS
+    // The old formula (250 / outerRadiusMm) only works when the board
+    // fills the entire 500-px scoring canvas. This derives the true scale
+    // from the ring radii that OpenCV can actually see in the warped image.
+    // ==========================================================
+    calibratePixelsPerMmFromRings(template) {
+        const detectedRadii = this.detectAllRingRadiiWarped(template);
+        if (!detectedRadii || detectedRadii.length < 3) {
+            // Not enough rings detected — fall back to assumption-based formula
+            const fallback = 250.0 / template.outerRadiusMm;
+            console.warn(`[CalibratePxMm] Insufficient rings (${detectedRadii ? detectedRadii.length : 0}), using formula fallback: ${fallback.toFixed(4)} px/mm`);
+            return fallback;
+        }
+
+        // The largest detected radius corresponds to the outermost visible ring.
+        // Use ALL ring-spacing samples and take the median for robustness.
+        const spacings = [];
+        for (let i = 1; i < detectedRadii.length; i++) {
+            spacings.push(detectedRadii[i] - detectedRadii[i - 1]);
+        }
+        spacings.sort((a, b) => a - b);
+        const medianSpacing = spacings[Math.floor(spacings.length / 2)];
+
+        // Each spacing = concentricSpacingMm in real-world units
+        const derived = medianSpacing / template.concentricSpacingMm;
+
+        // Sanity-check: must be within ±50% of the formula-based value
+        const formulaBased = 250.0 / template.outerRadiusMm;
+        if (derived < formulaBased * 0.5 || derived > formulaBased * 2.0) {
+            console.warn(`[CalibratePxMm] Derived value (${derived.toFixed(4)}) is out of range — using formula fallback`);
+            return formulaBased;
+        }
+
+        console.log(`[CalibratePxMm] Auto-calibrated: ${derived.toFixed(4)} px/mm (from ${detectedRadii.length} rings, median spacing=${medianSpacing.toFixed(1)}px)`);
+        return derived;
+    }
+
+    // ==========================================================
+    // FIX 4 — WARP QUALITY VALIDATION
+    // Checks that detected ring spacings are uniform after perspective warp.
+    // If variance > 20%, the homography is distorted and scores will be wrong.
+    // ==========================================================
+    validateWarpQuality(template) {
+        const radii = this.detectAllRingRadiiWarped(template);
+        if (!radii || radii.length < 3) {
+            return { valid: false, reason: 'Too few rings detected after warp. Try adjusting the corner pins.' };
+        }
+        const spacings = [];
+        for (let i = 1; i < radii.length; i++) spacings.push(radii[i] - radii[i - 1]);
+        const mean = spacings.reduce((s, v) => s + v, 0) / spacings.length;
+        const maxDev = Math.max(...spacings.map(s => Math.abs(s - mean) / mean));
+        if (maxDev > 0.22) {
+            return {
+                valid: false,
+                reason: `Ring spacing varies by ${(maxDev * 100).toFixed(0)}% — perspective warp may be inaccurate. Re-adjust corner pins.`
+            };
+        }
+        return { valid: true };
+    }
+
     hexToRgba(hex, alpha) {
         const r = parseInt(hex.slice(1, 3), 16);
         const g = parseInt(hex.slice(3, 5), 16);
@@ -1082,6 +1538,7 @@ y2: ${cand.y2.toFixed(2)}`);
         try {
             await this.processSingleFile(pendingItem.file);
             pendingItem.status = "success";
+            this.updateQueueItemStatus(pendingItem.id, "Success");
         } catch (err) {
             console.error("Failed to process file:", pendingItem.name, err);
             pendingItem.status = "error";
@@ -1413,6 +1870,9 @@ y2: ${cand.y2.toFixed(2)}`);
         if (this.warpedMat) this.warpedMat.delete();
         this.warpedMat = new cv.Mat();
         this.cachedBlackRadius = null;
+        this.currentSession.detectedRingRadii = null;
+        this.currentSession.detectedTargetCenter = null;
+        this.currentSession._calibratedPixelsPerMm = null; // FIX: invalidate ring-scale cache
         cv.warpPerspective(this.originalMat, this.warpedMat, M, new cv.Size(900, 900));
 
         // Save warped image base64
@@ -1425,7 +1885,11 @@ y2: ${cand.y2.toFixed(2)}`);
         // Calculate pixels per mm
         const template = this.getTargetTemplateDetails(this.currentSession.targetType);
         const pixelsPerMm = 400.0 / template.outerRadiusMm;
-        this.currentSession.calibration.pixelsPerMm = pixelsPerMm;
+        // Sync calibration object for the manual shot radius/area calculation below
+        // (ring-calibrated value, if available, will already be set on the object)
+        if (!this.currentSession._calibratedPixelsPerMm) {
+            this.currentSession.calibration.pixelsPerMm = pixelsPerMm;
+        }
 
         // Convert distance to pixels
         const distPx = distMm * pixelsPerMm;
@@ -1474,7 +1938,11 @@ y2: ${cand.y2.toFixed(2)}`);
 
     addManualHoleAtCoordinates(cx, cy) {
         const scoreObj = this.calculateAnalyticScore(cx, cy);
-        const distPx = Math.sqrt((cx - 250) ** 2 + (cy - 250) ** 2);
+        const center = (this.currentSession.detectedTargetCenter &&
+                        this.currentSession.detectedTargetCenter.valid)
+            ? this.currentSession.detectedTargetCenter
+            : { x: 250, y: 250 };
+        const distPx = Math.sqrt((cx - center.x) ** 2 + (cy - center.y) ** 2);
         const distReal = distPx / (this.currentSession.calibration.pixelsPerMm || 17.58);
 
         // Standard bullet diameter (5.6mm)
@@ -1527,10 +1995,71 @@ y2: ${cand.y2.toFixed(2)}`);
         this.cacheManualHoles();
     }
 
+    // ==========================================================
+    // MANUAL CENTER SETTING
+    // Called when the user clicks the bullseye in "Set Center" mode.
+    // Immediately rescores every existing shot from the new center.
+    // ==========================================================
+    setManualCenter(canvasX, canvasY) {
+        // canvasX/canvasY are in 900-space; convert to 500-space for the scoring engine
+        const cx500 = canvasX / 1.8;
+        const cy500 = canvasY / 1.8;
+
+        this.currentSession.detectedTargetCenter = {
+            x: cx500,
+            y: cy500,
+            valid: true,
+            _houghRan: true,     // prevent Hough from overwriting on next score call
+            _manuallySet: true
+        };
+
+        // Invalidate calibrated scale so next score call re-derives it from rings
+        this.currentSession._calibratedPixelsPerMm = null;
+
+        console.log(`[ManualCenter] Set to (${cx500.toFixed(1)}, ${cy500.toFixed(1)}) in 500-space`);
+
+        // Rescore every existing shot from the new center
+        const shots = this.currentSession.shots;
+        if (shots && shots.length > 0) {
+            for (const shot of shots) {
+                const updated = this.calculateAnalyticScore(shot.x, shot.y);
+                shot.score = updated.score;
+            }
+            // Re-sort by score descending (ISSF convention)
+            shots.sort((a, b) => b.score - a.score);
+        }
+
+        // Exit set-center mode
+        this.isSetCenterMode = false;
+        const btn = document.getElementById('set-center-btn');
+        if (btn) {
+            btn.classList.remove('active');
+            btn.innerHTML = '<i class="fa-solid fa-crosshairs"></i> Set Center';
+        }
+        const canvas = document.getElementById('analyzer-canvas');
+        if (canvas) canvas.style.cursor = 'crosshair';
+
+        // Refresh everything
+        this.renderWarpedCanvas();
+        this.updateShotListUI();
+        this.updateStatsUI();
+
+        // Show a quick confirmation badge
+        const statusBadge = document.getElementById('analyzer-canvas-badge');
+        const statusText  = document.getElementById('analyzer-status-badge-text');
+        if (statusBadge && statusText) {
+            statusText.innerHTML = `<i class="fa-solid fa-circle-check"></i> Center set — scores recalculated`;
+            statusBadge.className = 'canvas-status-floating status-success';
+            statusBadge.style.display = 'block';
+            setTimeout(() => { statusBadge.style.display = 'none'; }, 3000);
+        }
+    }
+
     toggleHoleAtCoordinates(cx, cy) {
         // Find if we clicked close to an existing shot in this session
         const clickRadius = 15; // px tolerance
         const hitIdx = this.currentSession.shots.findIndex(shot => {
+
             const dx = cx - shot.x;
             const dy = cy - shot.y;
             return Math.sqrt(dx*dx + dy*dy) < Math.max(shot.radius || 10, clickRadius);
@@ -1554,27 +2083,32 @@ y2: ${cand.y2.toFixed(2)}`);
             cv.cvtColor(mat, rgb, cv.COLOR_RGBA2RGB);
             cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
             
-            // Yellow HSV range: Hue 15 to 35, Saturation 50 to 255, Value 50 to 255
-            let low = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [15, 50, 50, 0]);
-            let high = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [35, 255, 255, 255]);
+            // Yellow/beige HSV range: Hue 10–40, Saturation 20–255, Value 120–255
+            // Widened to catch the full beige board paper, not just the bright inner rings
+            let low  = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [10, 20, 120, 0]);
+            let high = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [40, 255, 255, 255]);
             cv.inRange(hsv, low, high, mask);
+            
+            // Morphological close to fill small gaps in the yellow region
+            let kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(15, 15));
+            cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
+            kernel.delete();
             
             let contours = new cv.MatVector();
             let hierarchy = new cv.Mat();
             cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
             
             let maxArea = 0;
-            let bestRect = null;
+            let bestContour = null;
             
             for (let i = 0; i < contours.size(); i++) {
                 let contour = contours.get(i);
                 let area = cv.contourArea(contour);
-                if (area > 300) {
-                    let rect = cv.minAreaRect(contour);
-                    if (area > maxArea) {
-                        maxArea = area;
-                        bestRect = rect;
-                    }
+                // Must be large — at least 10% of image area — to be the board, not a noise blob
+                if (area > mat.rows * mat.cols * 0.10 && area > maxArea) {
+                    maxArea = area;
+                    if (bestContour) bestContour.delete();
+                    bestContour = contour.clone();
                 }
                 contour.delete();
             }
@@ -1584,11 +2118,15 @@ y2: ${cand.y2.toFixed(2)}`);
             contours.delete();
             hierarchy.delete();
             
-            if (bestRect) {
-                const cx = bestRect.center.x;
-                const cy = bestRect.center.y;
-                const r_yellow = Math.max(bestRect.size.width, bestRect.size.height) / 2;
-                return { cx, cy, r: r_yellow * 5 };
+            if (bestContour) {
+                // Use minEnclosingCircle to get the actual outer boundary radius
+                let circle = cv.minEnclosingCircle(bestContour);
+                const cx = circle.center.x;
+                const cy = circle.center.y;
+                const r  = circle.radius;
+                bestContour.delete();
+                console.log(`[BoardDetect] Yellow mask: center=(${cx.toFixed(0)},${cy.toFixed(0)}), radius=${r.toFixed(0)}px`);
+                return { cx, cy, r };
             }
         } catch (err) {
             console.warn("Yellow mask target detection failed:", err);
@@ -1599,6 +2137,7 @@ y2: ${cand.y2.toFixed(2)}`);
         }
         return null;
     }
+
 
     detectTargetClassical(mat) {
         let gray = new cv.Mat();
@@ -1799,6 +2338,9 @@ y2: ${cand.y2.toFixed(2)}`);
         if (this.warpedMat) this.warpedMat.delete();
         this.warpedMat = new cv.Mat();
         this.cachedBlackRadius = null;
+        this.currentSession.detectedRingRadii = null;
+        this.currentSession.detectedTargetCenter = null;
+        this.currentSession._calibratedPixelsPerMm = null; // FIX: invalidate ring-scale cache
         
         cv.warpPerspective(this.originalMat, this.warpedMat, M, new cv.Size(900, 900));
 
@@ -1862,8 +2404,12 @@ y2: ${cand.y2.toFixed(2)}`);
         const minCircularity = circEl ? parseFloat(circEl.value) : 0.60;
         const template = this.getTargetTemplateDetails(this.currentSession.targetType);
         
-        const pixelsPerMm = 400.0 / template.outerRadiusMm;
-        this.currentSession.calibration.pixelsPerMm = pixelsPerMm;
+        const pixelsPerMmFormula = 400.0 / template.outerRadiusMm;
+        // Only set provisional value — ring-calibration in calculateAnalyticScore will refine this
+        if (!this.currentSession._calibratedPixelsPerMm) {
+            this.currentSession.calibration.pixelsPerMm = pixelsPerMmFormula;
+        }
+        const pixelsPerMm = this.currentSession.calibration.pixelsPerMm;
 
         // Dynamic thresholds based on sensitivity
         const minArea = Math.max(4, Math.round(20 - (sensitivity * 0.16))); // 1 -> 20px, 100 -> 4px
@@ -2136,7 +2682,11 @@ y2: ${cand.y2.toFixed(2)}`);
             
             if (bestContour && maxArea > 10) {
                 let minDist = 999999;
-                const center = { x: 250, y: 250 };
+                const sc = (this.currentSession.detectedTargetCenter &&
+                            this.currentSession.detectedTargetCenter.valid)
+                    ? this.currentSession.detectedTargetCenter
+                    : { x: 250, y: 250 };
+                const center900 = { x: sc.x * 1.8, y: sc.y * 1.8 };
                 const data = bestContour.data32S;
                 for (let i = 0; i < data.length; i += 2) {
                     const pxLocal = data[i];
@@ -2144,7 +2694,7 @@ y2: ${cand.y2.toFixed(2)}`);
                     const pxGlobal = x1 + pxLocal;
                     const pyGlobal = y1 + pyLocal;
                     
-                    const dist = Math.sqrt((pxGlobal - center.x)**2 + (pyGlobal - center.y)**2);
+                    const dist = Math.sqrt((pxGlobal - center900.x)**2 + (pyGlobal - center900.y)**2);
                     if (dist < minDist) {
                         minDist = dist;
                         tipX = pxGlobal;
@@ -2172,8 +2722,10 @@ y2: ${cand.y2.toFixed(2)}`);
     runOpenCVFallbackProjection(detectedShots) {
         const M = this.getWarpPerspectiveMatrix();
         const template = this.getTargetTemplateDetails(this.currentSession.targetType);
-        const pixelsPerMm = 250.0 / template.outerRadiusMm;
-        this.currentSession.calibration.pixelsPerMm = pixelsPerMm;
+        // Only set provisional pixelsPerMm if ring-calibration hasn't run yet
+        if (!this.currentSession.calibration.pixelsPerMm) {
+            this.currentSession.calibration.pixelsPerMm = 250.0 / template.outerRadiusMm;
+        }
 
         if (!M || M.empty()) {
             const scale = 500 / this.resizedWidth;
@@ -2181,7 +2733,11 @@ y2: ${cand.y2.toFixed(2)}`);
             accepted.forEach(hole => {
                 const cx = hole.x * scale;
                 const cy = hole.y * scale;
-                const distPx = Math.sqrt((cx - 250) ** 2 + (cy - 250) ** 2);
+                const noMCenter = (this.currentSession.detectedTargetCenter &&
+                                   this.currentSession.detectedTargetCenter.valid)
+                    ? this.currentSession.detectedTargetCenter
+                    : { x: 250, y: 250 };
+                const distPx = Math.sqrt((cx - noMCenter.x) ** 2 + (cy - noMCenter.y) ** 2);
                 const distReal = distPx / this.currentSession.calibration.pixelsPerMm;
                 const scoreObj = this.calculateAnalyticScore(cx, cy);
                 const diameterMm = (Math.sqrt(hole.area / Math.PI) * 2) / this.currentSession.calibration.pixelsPerMm;
@@ -2214,7 +2770,11 @@ y2: ${cand.y2.toFixed(2)}`);
             const cy = proj.y / 1.8;
 
             if (cx > 5 && cx < 495 && cy > 5 && cy < 495) {
-                const distPx = Math.sqrt((cx - 250) ** 2 + (cy - 250) ** 2);
+                const cvCenter = (this.currentSession.detectedTargetCenter &&
+                                  this.currentSession.detectedTargetCenter.valid)
+                    ? this.currentSession.detectedTargetCenter
+                    : { x: 250, y: 250 };
+                const distPx = Math.sqrt((cx - cvCenter.x) ** 2 + (cy - cvCenter.y) ** 2);
                 if (distPx <= 250) {
                     const distReal = distPx / this.currentSession.calibration.pixelsPerMm;
                     const scoreObj = this.calculateAnalyticScore(cx, cy);
@@ -2291,10 +2851,48 @@ y2: ${cand.y2.toFixed(2)}`);
         console.log("After ROI filter:\ncount=" + afterROI.length);
 
         // 4. Scoring (including duplicate detection)
+        // FIX 5: For archery targets, use arrow tip (closest point to centre)
+        //        instead of bbox centre so scoring reflects the entry point.
         const afterScoring = [];
-        for (const item of afterROI) {
-            const { det, cx, cy, origX, origY, projX, projY } = item;
-            const distPx = Math.sqrt((cx - 250) ** 2 + (cy - 250) ** 2);
+        for (let item of afterROI) {
+            let { det, cx, cy, origX, origY, projX, projY } = item;
+            if (this.currentSession.targetType === 'archery-10ring' &&
+                this.warpedMat && !this.warpedMat.empty()) {
+                // Build a correct detection object in warped 900-space by projecting original bounding box corners
+                let det900;
+                if (M && !M.empty()) {
+                    const p1 = this.projectPoint(det.x1, det.y1, M);
+                    const p2 = this.projectPoint(det.x2, det.y2, M);
+                    det900 = {
+                        xc: projX,
+                        yc: projY,
+                        x1: Math.min(p1.x, p2.x),
+                        y1: Math.min(p1.y, p2.y),
+                        x2: Math.max(p1.x, p2.x),
+                        y2: Math.max(p1.y, p2.y)
+                    };
+                } else {
+                    const scale = 900 / this.resizedWidth;
+                    det900 = {
+                        xc: det.xc * scale,
+                        yc: det.yc * scale,
+                        x1: det.x1 * scale,
+                        y1: det.y1 * scale,
+                        x2: det.x2 * scale,
+                        y2: det.y2 * scale
+                    };
+                }
+                const tip = this.detectArrowTip(det900, this.warpedMat);
+                if (tip && (Math.abs(tip.xc - det900.xc) > 2 || Math.abs(tip.yc - det900.yc) > 2)) {
+                    cx = tip.xc / 1.8;
+                    cy = tip.yc / 1.8;
+                }
+            }
+            const center = (this.currentSession.detectedTargetCenter &&
+                            this.currentSession.detectedTargetCenter.valid)
+                ? this.currentSession.detectedTargetCenter
+                : { x: 250, y: 250 };
+            const distPx = Math.sqrt((cx - center.x) ** 2 + (cy - center.y) ** 2);
             const distReal = distPx / this.currentSession.calibration.pixelsPerMm;
             const scoreObj = this.calculateAnalyticScore(cx, cy);
             
@@ -2341,9 +2939,34 @@ y2: ${cand.y2.toFixed(2)}`);
         const detectedShots = [];
         const M = this.getWarpPerspectiveMatrix();
         const template = this.getTargetTemplateDetails(this.currentSession.targetType);
-        
-        const pixelsPerMm = 250.0 / template.outerRadiusMm;
-        this.currentSession.calibration.pixelsPerMm = pixelsPerMm;
+
+        // Pre-detect target center to ensure consistent reference for warp quality checks, tip detection, and scoring
+        if (!this.currentSession.detectedTargetCenter ||
+            (!this.currentSession.detectedTargetCenter._manuallySet &&
+             !this.currentSession.detectedTargetCenter._autoDetected)) {
+            const autoCenter = this.detectCenterMultiStrategy();
+            this.currentSession.detectedTargetCenter = { ...autoCenter };
+        }
+
+        // NOTE: pixelsPerMm is now managed by calculateAnalyticScore via
+        // calibratePixelsPerMmFromRings() — do NOT overwrite with the formula here.
+        // We set a provisional value only so stats don't blow up before first score call.
+        if (!this.currentSession.calibration.pixelsPerMm) {
+            this.currentSession.calibration.pixelsPerMm = 250.0 / template.outerRadiusMm;
+        }
+
+        // FIX 4: Validate warp quality and show a warning badge if distorted
+        if (this.warpedMat && !this.warpedMat.empty()) {
+            const warpCheck = this.validateWarpQuality(template);
+            const statusBadge = document.getElementById('analyzer-canvas-badge');
+            const statusText  = document.getElementById('analyzer-status-badge-text');
+            if (!warpCheck.valid && statusBadge && statusText) {
+                statusText.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> Warp Warning: ${warpCheck.reason}`;
+                statusBadge.className = 'canvas-status-floating status-warning';
+                statusBadge.style.display = 'block';
+                console.warn('[WarpQuality]', warpCheck.reason);
+            }
+        }
 
         if (engine === 'opencv') {
             this.runOpenCVFallbackProjection(detectedShots);
@@ -2711,7 +3334,9 @@ y2: ${cand.y2.toFixed(2)}`);
     }
 
     renderPerspectiveTraceOverlays(ctx, isWarpedView, M) {
-        const showTrace = document.getElementById('debug-perspective-trace')?.checked ?? true;
+        // Default OFF — the element may not exist in the HTML.
+        // The trace is a debug aid; it should not clutter the normal warped view.
+        const showTrace = document.getElementById('debug-perspective-trace')?.checked ?? false;
         if (!showTrace) return;
 
         const shots = this.currentSession.shots;
@@ -2723,73 +3348,51 @@ y2: ${cand.y2.toFixed(2)}`);
         ctx.save();
 
         shots.forEach((shot, idx) => {
-            if (shot.origX === undefined || shot.origY === undefined || shot.projX === undefined || shot.projY === undefined) {
+            if (shot.origX === undefined || shot.origY === undefined ||
+                shot.projX === undefined || shot.projY === undefined) {
                 return;
             }
 
             if (isWarpedView) {
-                // 1. Original hole center (in original image coordinates, scaled to 900x900 canvas)
-                const pt_orig = {
-                    x: (shot.origX / this.resizedWidth) * 900,
-                    y: (shot.origY / this.resizedHeight) * 900
-                };
+                // In warped view we only need to show the PROJECTED position (where the
+                // warp matrix mapped the hole to) vs the FINAL scoring position.
+                // Drawing the raw original-image coords on the warped canvas is
+                // meaningless and causes the "Orig scattered everywhere" bug.
 
-                // 2. Projected point (in warped 900x900 space)
+                // Warped 900-space projected position (this is where the hole landed after warp)
                 const pt_proj = {
                     x: shot.projX,
                     y: shot.projY
                 };
 
-                // 3. Final scoring point (in warped 900x900 space)
+                // Final scoring position (500-space → 900-space)
                 const pt_score = {
                     x: shot.x * 1.8,
                     y: shot.y * 1.8
                 };
 
-                // Draw Point 1: Original Center (Red circle)
-                ctx.beginPath();
-                ctx.arc(pt_orig.x, pt_orig.y, 4, 0, Math.PI * 2);
-                ctx.fillStyle = '#ef4444'; // Red
-                ctx.fill();
-                
-                // Label for Original Center
-                ctx.fillStyle = '#ef4444';
-                ctx.font = 'bold 9px var(--font-mono)';
-                ctx.fillText(`Orig #${idx + 1}`, pt_orig.x + 6, pt_orig.y - 4);
+                // Draw line from projected → scoring point (shows any post-warp adjustment)
+                if (Math.abs(pt_proj.x - pt_score.x) > 3 || Math.abs(pt_proj.y - pt_score.y) > 3) {
+                    ctx.beginPath();
+                    ctx.moveTo(pt_proj.x, pt_proj.y);
+                    ctx.lineTo(pt_score.x, pt_score.y);
+                    ctx.strokeStyle = '#10b981'; // Green
+                    ctx.lineWidth = 1.5;
+                    ctx.setLineDash([3, 3]);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                }
 
-                // Draw Line 1: Original Center -> Projected Point
+                // Projected point dot (amber)
                 ctx.beginPath();
-                ctx.moveTo(pt_orig.x, pt_orig.y);
-                ctx.lineTo(pt_proj.x, pt_proj.y);
-                ctx.strokeStyle = '#f59e0b'; // Amber/Yellow
-                ctx.lineWidth = 1.5;
-                ctx.setLineDash([4, 4]); // Dashed line
-                ctx.stroke();
-                ctx.setLineDash([]); // Reset line dash
-
-                // Draw Point 2: Projected Point (Orange circle)
-                ctx.beginPath();
-                ctx.arc(pt_proj.x, pt_proj.y, 4, 0, Math.PI * 2);
+                ctx.arc(pt_proj.x, pt_proj.y, 3, 0, Math.PI * 2);
                 ctx.fillStyle = '#f59e0b';
                 ctx.fill();
 
-                // Draw Line 2: Projected Point -> Final Scoring Point
-                ctx.beginPath();
-                ctx.moveTo(pt_proj.x, pt_proj.y);
-                ctx.lineTo(pt_score.x, pt_score.y);
-                ctx.strokeStyle = '#10b981'; // Green
-                ctx.lineWidth = 2;
-                ctx.stroke();
-
-                // Draw Point 3: Final Scoring Point (Green circle with white core)
-                ctx.beginPath();
-                ctx.arc(pt_score.x, pt_score.y, 5, 0, Math.PI * 2);
-                ctx.fillStyle = '#10b981';
-                ctx.fill();
-                ctx.beginPath();
-                ctx.arc(pt_score.x, pt_score.y, 2, 0, Math.PI * 2);
+                // Shot index label near the scoring point
                 ctx.fillStyle = '#ffffff';
-                ctx.fill();
+                ctx.font = 'bold 9px monospace';
+                ctx.fillText(`#${idx + 1}`, pt_score.x + 6, pt_score.y - 4);
 
             } else {
                 // In Original (Calibration) View
@@ -2943,119 +3546,132 @@ y2: ${cand.y2.toFixed(2)}`);
         applyBadgeStyle(combinedEl, combinedConf);
     }
 
+    getProportionalMapping() {
+        const w = this.originalImage ? this.originalImage.naturalWidth : 900;
+        const h = this.originalImage ? this.originalImage.naturalHeight : 900;
+        let scale = Math.min(900 / w, 900 / h);
+        let drawW = w * scale;
+        let drawH = h * scale;
+        let offsetX = (900 - drawW) / 2;
+        let offsetY = (900 - drawH) / 2;
+        return { drawW, drawH, offsetX, offsetY };
+    }
+
     mapRawToCanvas(x, y) {
+        const m = this.getProportionalMapping();
         return {
-            x: (x / this.resizedWidth) * 900,
-            y: (y / this.resizedHeight) * 900
+            x: m.offsetX + (x / this.resizedWidth) * m.drawW,
+            y: m.offsetY + (y / this.resizedHeight) * m.drawH
         };
     }
 
     mapRawRadiusToCanvas(r) {
-        return (r / this.resizedWidth) * 900;
+        const m = this.getProportionalMapping();
+        return (r / this.resizedWidth) * m.drawW;
     }
 
     calculateAnalyticScore(x, y) {
-        let center = { x: 250, y: 250 };
+        const template = this.getTargetTemplateDetails(this.currentSession.targetType);
+
+        // ── Robust center detection ─────────────────────────────────────────────
+        if (!this.currentSession.detectedTargetCenter ||
+            (!this.currentSession.detectedTargetCenter._manuallySet &&
+             !this.currentSession.detectedTargetCenter._autoDetected)) {
+            const autoCenter = this.detectCenterMultiStrategy();
+            this.currentSession.detectedTargetCenter = { ...autoCenter };
+        }
+        const center = (this.currentSession.detectedTargetCenter &&
+                        this.currentSession.detectedTargetCenter.valid)
+            ? this.currentSession.detectedTargetCenter
+            : { x: 250, y: 250 };
+
         const dx = x - center.x;
         const dy = y - center.y;
         const distPx = Math.sqrt(dx*dx + dy*dy);
 
-        // Fetch scoring configuration rules
-        const scoringRule = document.getElementById('scoring-rule').value;
-        const template = this.getTargetTemplateDetails(this.currentSession.targetType);
+        // ── Always use strict center-point scoring (no line-cutter radius deduction) ──
+        // Score is determined purely from the Euclidean distance between the hole
+        // center and the target center in the perspective-warped 500-space coordinate
+        // system. The line-cutter rule is intentionally not applied here.
+        const scoringDistance = distPx;
 
-        let pixelsPerMm = 250.0 / template.outerRadiusMm;
-        
-        // Dynamically detect black circle radius to perfect calibration for standard targets
-        if (this.currentSession.targetType === 'olympic-rifle' || this.currentSession.targetType === 'olympic-pistol') {
+        // ── Image-derived pixelsPerMm ───────────────────────────────────────────
+        let pixelsPerMm;
+
+        if (this.currentSession.targetType === 'olympic-rifle' ||
+            this.currentSession.targetType === 'olympic-pistol') {
             const blackRadiusPx = this.detectBlackCircleRadiusWarped();
             if (blackRadiusPx && blackRadiusPx > 20) {
                 const blackRadiusMm = this.currentSession.targetType === 'olympic-rifle' ? 15.25 : 29.75;
                 pixelsPerMm = blackRadiusPx / blackRadiusMm;
+                console.log(`[PxMm] Black-circle calibration: ${pixelsPerMm.toFixed(4)} px/mm`);
             }
         }
 
-        const projRadiusPx = 2.25 * pixelsPerMm;
-
-        let scoringDistance = distPx;
-        if (scoringRule === 'line-cutter') {
-            scoringDistance = Math.max(0, distPx - projRadiusPx);
+        if (!pixelsPerMm) {
+            if (!this.currentSession._calibratedPixelsPerMm) {
+                this.currentSession._calibratedPixelsPerMm = this.calibratePixelsPerMmFromRings(template);
+            }
+            pixelsPerMm = this.currentSession._calibratedPixelsPerMm;
         }
 
+        // Keep calibration object in sync so stats are correct
+        this.currentSession.calibration.pixelsPerMm = pixelsPerMm;
+
+        const maxScore     = template.scoreMax || 10.9;
+        const ringCount    = template.ringCount || 10;
+
+        // ── Detect actual ring boundaries in 500-space from warped image ────────
+        const detectedRadii = this.detectAllRingRadiiWarped(template);
+        const B = [0.0].concat(detectedRadii.slice(0, ringCount));
+
+        // ── Scaled edge tolerance (proportional to warp ratio) ──────────────────
+        const outerBoundaryPx = B.length > ringCount ? B[ringCount] : 250.0;
+        const tolerancePx = 2.0 * (250.0 / Math.max(outerBoundaryPx, 50.0));
+
+        // ── Piecewise scoring using detected ring boundaries ────────────────────
         let score = 0;
+        let assigned_k = null;
 
-        if (this.currentSession.targetType === 'knsa-bullet') {
-            const ring12Radius = this.detectInnermostCircleWarped();
-            const ring11Boundary = ring12Radius * 2;
-            const innerBoundary = 120.0;
-            const outerBoundary = 250.0;
-
-            if (scoringDistance <= ring12Radius) {
-                const fraction = 1.0 - (scoringDistance / ring12Radius);
-                score = 12.0 + fraction;
-            } else if (scoringDistance <= ring11Boundary) {
-                const fraction = 1.0 - ((scoringDistance - ring12Radius) / ring12Radius);
-                score = 11.0 + fraction;
-            } else if (scoringDistance <= innerBoundary) {
-                const div_inner = (innerBoundary - ring11Boundary) / 4;
-                const offset = scoringDistance - ring11Boundary;
-                const idx = Math.floor(offset / div_inner);
-                const fraction = 1.0 - ((offset - idx * div_inner) / div_inner);
-                score = (10 - idx) + fraction;
-            } else if (scoringDistance <= outerBoundary) {
-                const div_outer = (outerBoundary - innerBoundary) / 6;
-                const offset = scoringDistance - innerBoundary;
-                const idx = Math.floor(offset / div_outer);
-                const fraction = 1.0 - ((offset - idx * div_outer) / div_outer);
-                score = (6 - idx) + fraction;
-            }
-        } else if (this.currentSession.targetType === 'archery-10ring') {
-            // Adaptive yellow radius detection
-            const yellowRadius = this.detectYellowRadiusWarped();
-            const outerBoundary = 250.0;
-
-            if (scoringDistance <= yellowRadius) {
-                if (scoringDistance <= yellowRadius / 2) {
-                    const fraction = 1.0 - (scoringDistance / (yellowRadius / 2));
-                    score = 10.0 + fraction;
-                } else {
-                    const fraction = 1.0 - ((scoringDistance - yellowRadius / 2) / (yellowRadius / 2));
-                    score = 9.0 + fraction;
-                }
-            } else if (scoringDistance <= outerBoundary) {
-                const ringWidthOuter = (outerBoundary - yellowRadius) / 8;
-                const offset = scoringDistance - yellowRadius;
-                const idx = Math.floor(offset / ringWidthOuter);
-                const fraction = 1.0 - ((offset - idx * ringWidthOuter) / ringWidthOuter);
-                score = (8 - idx) + fraction;
-            }
-        } else {
-            // Physically accurate target scoring using template dimensions
-            const maxScore = template.scoreMax || 10.9;
-            const ringCount = template.ringCount || 10;
-            const spacingMm = template.concentricSpacingMm || (template.outerRadiusMm / ringCount);
-            const distanceMm = scoringDistance / pixelsPerMm;
-            
-            if (distanceMm <= template.outerRadiusMm) {
-                // Number of full rings inwards from the outer edge
-                const depthFromOuter = template.outerRadiusMm - distanceMm;
-                const ringIndex = Math.floor(depthFromOuter / spacingMm);
-                
-                let baseScore = template.scoreMin + ringIndex;
-                if (baseScore > Math.floor(maxScore)) baseScore = Math.floor(maxScore);
-                
-                const distanceInCurrentRing = depthFromOuter - (ringIndex * spacingMm);
-                const fraction = distanceInCurrentRing / spacingMm;
-                
-                score = baseScore + fraction;
-                if (score > maxScore) score = maxScore;
-            } else {
-                score = 0.0;
+        for (let k = 0; k < ringCount; k++) {
+            if (k + 1 < B.length && B[k] <= scoringDistance && scoringDistance < B[k + 1]) {
+                assigned_k = k;
+                break;
             }
         }
 
-        if (score < 1.0) score = 0.0;
-        if (score > 12.0) score = 12.0;
+        // Fallback: check with tolerance at the very outer edge
+        if (assigned_k === null && B.length > ringCount) {
+            if (scoringDistance - B[ringCount] <= tolerancePx) {
+                assigned_k = ringCount - 1;
+            }
+        }
+
+        if (assigned_k !== null) {
+            // Benefit of the doubt: if very close to the inner boundary, upgrade
+            if (assigned_k > 0 && (scoringDistance - B[assigned_k]) <= tolerancePx) {
+                const final_k = assigned_k - 1;
+                const fraction = 0.9999;
+                const int_score = ringCount - final_k;
+                score = int_score + 0.99 - 0.99 * fraction;
+            } else {
+                const final_k = assigned_k;
+                const w_ring = B[final_k + 1] - B[final_k];
+                let fraction = w_ring > 0 ? (scoringDistance - B[final_k]) / w_ring : 0;
+                fraction = Math.max(0.0, Math.min(0.9999, fraction));
+                const int_score = ringCount - final_k;
+                score = int_score + 0.99 - 0.99 * fraction;
+            }
+            score = Math.round(score * 100) / 100;
+        } else {
+            score = 0.0;
+        }
+
+        // Hard limits
+        score = Math.min(score, maxScore);
+        score = Math.max(score, 0.0);
+
+        console.log(`[Scoring] Center-point mode: dist=${distPx.toFixed(2)}px (no radius deduction), assigned_k=${assigned_k}, boundaries=[${B.map(b=>b.toFixed(1)).join(',')}], score=${score}`);
 
         return { score };
     }
@@ -3088,10 +3704,16 @@ y2: ${cand.y2.toFixed(2)}`);
                     let rect = cv.minAreaRect(contour);
                     const cx = rect.center.x;
                     const cy = rect.center.y;
-                    const distToCenter = Math.sqrt((cx - 250)**2 + (cy - 250)**2);
-                    if (distToCenter < 50 && area > maxArea) {
+                    const center = (this.currentSession.detectedTargetCenter &&
+                                    this.currentSession.detectedTargetCenter.valid)
+                        ? this.currentSession.detectedTargetCenter
+                        : { x: 250, y: 250 };
+                    const cxCenter900 = center.x * 1.8;
+                    const cyCenter900 = center.y * 1.8;
+                    const distToCenter = Math.sqrt((cx - cxCenter900)**2 + (cy - cyCenter900)**2);
+                    if (distToCenter < 90 && area > maxArea) {
                         maxArea = area;
-                        yellowRadius = (rect.size.width + rect.size.height) / 4;
+                        yellowRadius = ((rect.size.width + rect.size.height) / 4) / 1.8;
                     }
                 }
                 contour.delete();
@@ -3110,6 +3732,174 @@ y2: ${cand.y2.toFixed(2)}`);
             hsv.delete();
             mask.delete();
         }
+    }
+
+    detectAllRingRadiiWarped(template) {
+        if (this.currentSession.detectedRingRadii && this.currentSession.detectedRingRadii.length > 0) {
+            return this.currentSession.detectedRingRadii;
+        }
+
+        const ringCount = template.ringCount || 10;
+        let defaultSpacing = 250.0 / ringCount;
+        let expectedRadii = [];
+        for (let i = 1; i <= ringCount; i++) {
+            expectedRadii.push(i * defaultSpacing);
+        }
+
+        if (!this.warpedMat || this.warpedMat.empty()) {
+            if (!this.currentSession.detectedTargetCenter ||
+                (!this.currentSession.detectedTargetCenter._manuallySet &&
+                 !this.currentSession.detectedTargetCenter._autoDetected)) {
+                this.currentSession.detectedTargetCenter = { x: 250, y: 250, valid: false };
+            }
+            return expectedRadii;
+        }
+        
+        let gray = new cv.Mat();
+        let blurred = new cv.Mat();
+        let edges = new cv.Mat();
+        let contours = new cv.MatVector();
+        let hierarchy = new cv.Mat();
+        
+        let detectedRadii = [];
+        let validCenters = [];
+
+        const center = (this.currentSession.detectedTargetCenter &&
+                        this.currentSession.detectedTargetCenter.valid)
+            ? this.currentSession.detectedTargetCenter
+            : { x: 250, y: 250 };
+        const cxCenter900 = center.x * 1.8;
+        const cyCenter900 = center.y * 1.8;
+
+        try {
+            cv.cvtColor(this.warpedMat, gray, cv.COLOR_RGBA2GRAY);
+            cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+            cv.Canny(blurred, edges, 50, 150, 3, false);
+            
+            cv.findContours(edges, contours, hierarchy, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
+            
+            for (let i = 0; i < contours.size(); i++) {
+                let contour = contours.get(i);
+                if (contour.rows < 5) continue;
+                
+                let area = cv.contourArea(contour);
+                let perimeter = cv.arcLength(contour, true);
+                if (perimeter === 0) continue;
+                
+                let circularity = 4 * Math.PI * area / (perimeter * perimeter);
+                
+                if (circularity > 0.35) {
+                    let rect = cv.minAreaRect(contour);
+                    const cx = rect.center.x;
+                    const cy = rect.center.y;
+                    const distToCenter = Math.sqrt((cx - cxCenter900)**2 + (cy - cyCenter900)**2);
+                    
+                    if (distToCenter < 150) {
+                        let radiusPx900 = (rect.size.width + rect.size.height) / 4;
+                        let radiusPx500 = radiusPx900 / 1.8;
+                        if (radiusPx500 > 5 && radiusPx500 < 400) {
+                            detectedRadii.push(radiusPx500);
+                            validCenters.push({ x: cx / 1.8, y: cy / 1.8 });
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn("Error detecting ring radii:", e);
+        } finally {
+            gray.delete();
+            blurred.delete();
+            edges.delete();
+            contours.delete();
+            hierarchy.delete();
+        }
+
+        detectedRadii.sort((a, b) => a - b);
+        let clusteredRadii = [];
+        for (let r of detectedRadii) {
+            if (clusteredRadii.length === 0) {
+                clusteredRadii.push(r);
+            } else {
+                let last = clusteredRadii[clusteredRadii.length - 1];
+                if (r - last > 5) {
+                    clusteredRadii.push(r);
+                } else {
+                    clusteredRadii[clusteredRadii.length - 1] = (last + r) / 2;
+                }
+            }
+        }
+
+        let finalRadii = [];
+        if (clusteredRadii.length >= 2) {
+            let spacings = [];
+            for (let i = 1; i < clusteredRadii.length; i++) {
+                spacings.push(clusteredRadii[i] - clusteredRadii[i - 1]);
+            }
+            spacings.sort((a, b) => a - b);
+            let medianSpacing = spacings[Math.floor(spacings.length / 2)];
+            
+            for (let i = 1; i <= ringCount; i++) {
+                let expectedRadius = i * medianSpacing;
+                let closest = clusteredRadii.reduce((prev, curr) => 
+                    Math.abs(curr - expectedRadius) < Math.abs(prev - expectedRadius) ? curr : prev
+                );
+                
+                if (Math.abs(closest - expectedRadius) < medianSpacing * 0.35) {
+                    finalRadii.push(closest);
+                } else {
+                    if (finalRadii.length > 0) {
+                        finalRadii.push(finalRadii[finalRadii.length - 1] + medianSpacing);
+                    } else {
+                        finalRadii.push(expectedRadius);
+                    }
+                }
+            }
+        } else {
+            finalRadii = expectedRadii;
+        }
+
+        // Validate and compute geometric center
+        if (validCenters.length >= 2) {
+            let avgX = 0;
+            let avgY = 0;
+            for (let pt of validCenters) {
+                avgX += pt.x;
+                avgY += pt.y;
+            }
+            avgX /= validCenters.length;
+            avgY /= validCenters.length;
+
+            let maxDist = 0;
+            for (let pt of validCenters) {
+                const dist = Math.sqrt((pt.x - avgX)**2 + (pt.y - avgY)**2);
+                if (dist > maxDist) maxDist = dist;
+            }
+
+            if (maxDist < 10.0) {
+                if (!this.currentSession.detectedTargetCenter ||
+                    (!this.currentSession.detectedTargetCenter._manuallySet &&
+                     !this.currentSession.detectedTargetCenter._autoDetected)) {
+                    this.currentSession.detectedTargetCenter = { x: avgX, y: avgY, valid: true };
+                }
+            } else {
+                console.warn(`[Scoring] Ring centers vary too much (max dev: ${maxDist.toFixed(1)}px). Falling back to previous or default center.`);
+                if (!this.currentSession.detectedTargetCenter ||
+                    (!this.currentSession.detectedTargetCenter._manuallySet &&
+                     !this.currentSession.detectedTargetCenter._autoDetected)) {
+                    this.currentSession.detectedTargetCenter = { x: 250, y: 250, valid: false };
+                }
+            }
+        } else {
+            console.warn(`[Scoring] Only ${validCenters.length} rings detected. Insufficient consensus. Falling back to previous or default center.`);
+            if (!this.currentSession.detectedTargetCenter ||
+                (!this.currentSession.detectedTargetCenter._manuallySet &&
+                 !this.currentSession.detectedTargetCenter._autoDetected)) {
+                this.currentSession.detectedTargetCenter = { x: 250, y: 250, valid: false };
+            }
+        }
+
+        this.currentSession.detectedRingRadii = finalRadii;
+        return finalRadii;
     }
 
     detectInnermostCircleWarped() {
@@ -3136,9 +3926,15 @@ y2: ${cand.y2.toFixed(2)}`);
                     let rect = cv.minAreaRect(contour);
                     const cx = rect.center.x;
                     const cy = rect.center.y;
-                    const distToCenter = Math.sqrt((cx - 250)**2 + (cy - 250)**2);
-                    if (distToCenter < 30) {
-                        let radius = (rect.size.width + rect.size.height) / 4;
+                    const center = (this.currentSession.detectedTargetCenter &&
+                                    this.currentSession.detectedTargetCenter.valid)
+                        ? this.currentSession.detectedTargetCenter
+                        : { x: 250, y: 250 };
+                    const cxCenter900 = center.x * 1.8;
+                    const cyCenter900 = center.y * 1.8;
+                    const distToCenter = Math.sqrt((cx - cxCenter900)**2 + (cy - cyCenter900)**2);
+                    if (distToCenter < 54) {
+                        let radius = ((rect.size.width + rect.size.height) / 4) / 1.8;
                         if (radius < minRadius) {
                             minRadius = radius;
                         }
@@ -3189,11 +3985,17 @@ y2: ${cand.y2.toFixed(2)}`);
                     let rect = cv.minEnclosingCircle(contour);
                     let cx = rect.center.x;
                     let cy = rect.center.y;
-                    let distToCenter = Math.sqrt((cx - 250)**2 + (cy - 250)**2);
+                    const center = (this.currentSession.detectedTargetCenter &&
+                                    this.currentSession.detectedTargetCenter.valid)
+                        ? this.currentSession.detectedTargetCenter
+                        : { x: 250, y: 250 };
+                    const cxCenter900 = center.x * 1.8;
+                    const cyCenter900 = center.y * 1.8;
+                    let distToCenter = Math.sqrt((cx - cxCenter900)**2 + (cy - cyCenter900)**2);
                     // The black circle should be roughly centered
-                    if (distToCenter < 100 && area > maxArea) {
+                    if (distToCenter < 180 && area > maxArea) {
                         maxArea = area;
-                        bestRadius = rect.radius;
+                        bestRadius = rect.radius / 1.8;
                     }
                 }
                 contour.delete();
@@ -3414,15 +4216,54 @@ y2: ${cand.y2.toFixed(2)}`);
         const showCenter = document.getElementById('layer-center')?.checked ?? true;
         const showScores = document.getElementById('layer-scores')?.checked ?? true;
 
-        // Draw center crosshair
+        // Draw center crosshair — at the ACTUAL detected/set center, not a hardcoded point
         if (showCenter) {
             ctx.save();
+
+            // Resolve scoring center: prefer manually set or Hough-detected center
+            const sc = (this.currentSession.detectedTargetCenter &&
+                        this.currentSession.detectedTargetCenter.valid)
+                ? this.currentSession.detectedTargetCenter
+                : { x: 250, y: 250 };
+
+            // Scale from 500-space to 900-space
+            const cx900 = sc.x * 1.8;
+            const cy900 = sc.y * 1.8;
+
+            // Cross-hair lines
             ctx.strokeStyle = 'rgba(239, 68, 68, 0.85)';
             ctx.lineWidth = 1;
             ctx.beginPath();
-            ctx.moveTo(450, 20); ctx.lineTo(450, 880);
-            ctx.moveTo(20, 450); ctx.lineTo(880, 450);
+            ctx.moveTo(cx900, 12); ctx.lineTo(cx900, 888);
+            ctx.moveTo(12, cy900); ctx.lineTo(888, cy900);
             ctx.stroke();
+
+            // Center dot
+            ctx.beginPath();
+            ctx.arc(cx900, cy900, 5, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(239, 68, 68, 0.9)';
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(cx900, cy900, 2, 0, Math.PI * 2);
+            ctx.fillStyle = '#ffffff';
+            ctx.fill();
+
+            // Badge label if manually set
+            if (this.currentSession.detectedTargetCenter?._manuallySet) {
+                ctx.fillStyle = 'rgba(239, 68, 68, 0.9)';
+                ctx.font = 'bold 9px monospace';
+                ctx.fillText('CENTER (manual)', cx900 + 8, cy900 - 6);
+            }
+
+            ctx.restore();
+        }
+
+        // "Set Center" cursor hint
+        if (this.isSetCenterMode) {
+            ctx.save();
+            ctx.fillStyle = 'rgba(239, 68, 68, 0.9)';
+            ctx.font = 'bold 11px monospace';
+            ctx.fillText('🎯 Click on the BULLSEYE to set center', 14, 18);
             ctx.restore();
         }
 
@@ -3477,49 +4318,25 @@ y2: ${cand.y2.toFixed(2)}`);
         ctx.strokeStyle = 'rgba(16, 185, 129, 0.4)';
         ctx.lineWidth = 1.5;
 
-        const targetType = this.currentSession.targetType;
-        if (targetType === 'knsa-bullet') {
-            const ring12Radius = this.detectInnermostCircleWarped();
-            const ring11Boundary = ring12Radius * 2;
-            const innerBoundary = 120.0;
-            const outerBoundary = 250.0;
+        const sc = (this.currentSession.detectedTargetCenter &&
+                    this.currentSession.detectedTargetCenter.valid)
+            ? this.currentSession.detectedTargetCenter
+            : { x: 250, y: 250 };
+        const cxCenter900 = sc.x * 1.8;
+        const cyCenter900 = sc.y * 1.8;
 
-            // Draw Ring 12 and 11
-            ctx.beginPath(); ctx.arc(450, 450, ring12Radius * 1.8, 0, Math.PI * 2); ctx.stroke();
-            ctx.beginPath(); ctx.arc(450, 450, ring11Boundary * 1.8, 0, Math.PI * 2); ctx.stroke();
+        const template = this.getTargetTemplateDetails(this.currentSession.targetType);
+        const ringCount = template.ringCount || 10;
 
-            // Draw inner rings (10 to 7)
-            const div_inner = (innerBoundary - ring11Boundary) / 4;
-            for (let i = 1; i <= 4; i++) {
-                const r = ring11Boundary + i * div_inner;
-                ctx.beginPath(); ctx.arc(450, 450, r * 1.8, 0, Math.PI * 2); ctx.stroke();
-            }
+        // Use detected ring radii (from warped image edge analysis) for accurate overlays
+        const detectedRadii = this.detectAllRingRadiiWarped(template);
 
-            // Draw outer rings (6 to 1)
-            const div_outer = (outerBoundary - innerBoundary) / 6;
-            for (let i = 1; i <= 6; i++) {
-                const r = innerBoundary + i * div_outer;
-                ctx.beginPath(); ctx.arc(450, 450, r * 1.8, 0, Math.PI * 2); ctx.stroke();
-            }
-        } else if (targetType === 'archery-10ring') {
-            const yellowRadius = this.detectYellowRadiusWarped();
-            const outerBoundary = 250.0;
-
-            // Gold rings (10 and 9)
-            ctx.beginPath(); ctx.arc(450, 450, (yellowRadius / 2) * 1.8, 0, Math.PI * 2); ctx.stroke();
-            ctx.beginPath(); ctx.arc(450, 450, yellowRadius * 1.8, 0, Math.PI * 2); ctx.stroke();
-
-            // Outer rings (8 to 1)
-            const ringWidthOuter = (outerBoundary - yellowRadius) / 8;
-            for (let i = 1; i <= 8; i++) {
-                const r = yellowRadius + i * ringWidthOuter;
-                ctx.beginPath(); ctx.arc(450, 450, r * 1.8, 0, Math.PI * 2); ctx.stroke();
-            }
-        } else {
-            // Standard / Uniform
-            for (let r = 25; r <= 250; r += 25) {
+        for (let i = 0; i < Math.min(ringCount, detectedRadii.length); i++) {
+            const rPx500 = detectedRadii[i];
+            if (rPx500 > 0) {
+                const rPx900 = rPx500 * 1.8;
                 ctx.beginPath();
-                ctx.arc(450, 450, r * 1.8, 0, Math.PI * 2);
+                ctx.arc(cxCenter900, cyCenter900, rPx900, 0, Math.PI * 2);
                 ctx.stroke();
             }
         }
@@ -3539,7 +4356,8 @@ y2: ${cand.y2.toFixed(2)}`);
         } else if (showEdge && this.debugEdgeMat) {
             this.drawMatToCanvas(this.debugEdgeMat, canvas);
         } else if (this.originalImage) {
-            ctx.drawImage(this.originalImage, 0, 0, canvas.width, canvas.height);
+            const m = this.getProportionalMapping();
+            ctx.drawImage(this.originalImage, m.offsetX, m.offsetY, m.drawW, m.drawH);
         }
 
         // Draw debug overlays (Accepted, Rejected, Confidence) on original canvas
@@ -3604,22 +4422,24 @@ y2: ${cand.y2.toFixed(2)}`);
     }
 
     mapPinToCanvas(pin) {
-        // Map from natural image coordinates to 900x900 canvas space
+        // Map from natural image coordinates to 900x900 canvas space proportionally
+        const m = this.getProportionalMapping();
         const w = this.originalImage ? this.originalImage.naturalWidth : 900;
         const h = this.originalImage ? this.originalImage.naturalHeight : 900;
         return {
-            x: Math.round((pin.x / w) * 900),
-            y: Math.round((pin.y / h) * 900)
+            x: Math.round(m.offsetX + (pin.x / w) * m.drawW),
+            y: Math.round(m.offsetY + (pin.y / h) * m.drawH)
         };
     }
 
     mapCanvasToPin(x, y) {
         // Map from 900x900 canvas space back to natural image coordinates
+        const m = this.getProportionalMapping();
         const w = this.originalImage ? this.originalImage.naturalWidth : 900;
         const h = this.originalImage ? this.originalImage.naturalHeight : 900;
         return {
-            x: Math.round((x / 900) * w),
-            y: Math.round((y / 900) * h)
+            x: Math.round(((x - m.offsetX) / m.drawW) * w),
+            y: Math.round(((y - m.offsetY) / m.drawH) * h)
         };
     }
 
@@ -4366,11 +5186,20 @@ document.addEventListener('DOMContentLoaded', () => {
         const canvas = document.getElementById('analyzer-canvas');
         if (canvas) {
             canvas.addEventListener('click', (e) => {
-                // Only allow adding holes manually if we are NOT in calibration/pins mode
-                if (window.analyzer.originalImage && !window.analyzer.isCalibrating && !window.analyzer.isWarpModeActive) {
-                    const rect = canvas.getBoundingClientRect();
-                    const cx = rect.width > 0 ? (((e.clientX - rect.left) / rect.width) * canvas.width) : (e.clientX - rect.left);
-                    const cy = rect.height > 0 ? (((e.clientY - rect.top) / rect.height) * canvas.height) : (e.clientY - rect.top);
+                if (!window.analyzer.originalImage) return;
+
+                const rect = canvas.getBoundingClientRect();
+                const cx = rect.width > 0 ? (((e.clientX - rect.left) / rect.width) * canvas.width) : (e.clientX - rect.left);
+                const cy = rect.height > 0 ? (((e.clientY - rect.top) / rect.height) * canvas.height) : (e.clientY - rect.top);
+
+                // "Set Center" mode: next click sets the scoring center
+                if (window.analyzer.isSetCenterMode) {
+                    window.analyzer.setManualCenter(cx, cy);
+                    return;
+                }
+
+                // Normal mode: add/remove holes
+                if (!window.analyzer.isCalibrating && !window.analyzer.isWarpModeActive) {
                     window.analyzer.toggleHoleAtCoordinates(cx / 1.8, cy / 1.8);
                 }
             });
@@ -4821,6 +5650,28 @@ document.addEventListener('DOMContentLoaded', () => {
                     window.analyzer.showCornerPinsOverlay();
                     window.analyzer.renderCalibrationCanvas();
                 }
+            }
+        });
+    }
+
+    // Set-Center mode toggle button
+    const setCenterBtn = document.getElementById('set-center-btn');
+    if (setCenterBtn) {
+        setCenterBtn.addEventListener('click', () => {
+            if (!window.analyzer.originalImage) return;
+            window.analyzer.isSetCenterMode = !window.analyzer.isSetCenterMode;
+            if (window.analyzer.isSetCenterMode) {
+                setCenterBtn.classList.add('active');
+                setCenterBtn.innerHTML = '<i class="fa-solid fa-xmark"></i> Cancel';
+                const canvas = document.getElementById('analyzer-canvas');
+                if (canvas) canvas.style.cursor = 'none';
+                window.analyzer.renderWarpedCanvas();
+            } else {
+                setCenterBtn.classList.remove('active');
+                setCenterBtn.innerHTML = '<i class="fa-solid fa-crosshairs"></i> Set Center';
+                const canvas = document.getElementById('analyzer-canvas');
+                if (canvas) canvas.style.cursor = 'crosshair';
+                window.analyzer.renderWarpedCanvas();
             }
         });
     }

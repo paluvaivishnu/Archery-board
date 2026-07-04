@@ -13,7 +13,7 @@
     <!-- Custom Stylesheet -->
     <link rel="stylesheet" href="style.css?v=15">
 </head>
-<body>
+<body class="dark-theme">
     <div class="app-container">
         <!-- Header -->
         <header class="app-header">
@@ -42,7 +42,7 @@
             </nav>
             <div class="header-actions">
                 <button id="theme-toggle" class="icon-btn" title="Toggle Theme">
-                    <i class="fa-solid fa-moon"></i>
+                    <i class="fa-solid fa-sun"></i>
                 </button>
             </div>
         </header>
@@ -80,8 +80,8 @@
                             <div class="control-group">
                                 <label for="scoring-rule">Scoring Rule</label>
                                 <select id="scoring-rule">
-                                    <option value="line-cutter" selected>Line Cutter (Higher score if touching)</option>
-                                    <option value="center-only">Center-Point (Strict center coordinate)</option>
+                                    <option value="line-cutter">Line Cutter (Higher score if touching)</option>
+                                    <option value="center-only" selected>Center-Point (Strict center coordinate)</option>
                                 </select>
                             </div>
 
@@ -208,6 +208,10 @@
 
                             <button id="analyze-target-btn" class="btn btn-primary btn-full" style="margin-top: 0.5rem;">
                                 <i class="fa-solid fa-bullseye"></i> Analyze & Detect Holes
+                            </button>
+
+                            <button id="set-center-btn" class="btn btn-full" style="margin-top: 0.35rem; background: rgba(239, 68, 68, 0.08); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.25); font-weight: 600; font-size: 0.72rem;">
+                                <i class="fa-solid fa-crosshairs"></i> Set Center
                             </button>
 
                             <button id="analyzer-save-hitl-main" class="btn btn-full" style="margin-top: 0.5rem; background: rgba(59, 130, 246, 0.1); color: #3b82f6; border: 1px solid rgba(59, 130, 246, 0.3); font-weight: bold;">
@@ -715,7 +719,7 @@
     <!-- Local Application Scripts -->
     <script src="sound_effects.js?v=17"></script>
     <script src="dataset_generator.js?v=17"></script>
-    <script src="image_analyzer.js?v=17"></script>
+    <script src="image_analyzer.js?v=20"></script>
     <script src="app.js?v=17"></script>
 </body>
 </html>

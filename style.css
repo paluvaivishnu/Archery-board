@@ -1237,6 +1237,35 @@ tr:hover td {
     box-shadow: var(--shadow-lg);
     z-index: 15;
 }
+.canvas-status-floating.status-info {
+    border-color: #3b82f6;
+    color: #60a5fa;
+    background: rgba(59, 130, 246, 0.12);
+}
+.canvas-status-floating.status-warning {
+    border-color: #f59e0b;
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.15);
+    animation: pulse-warning 2s ease-in-out infinite;
+}
+.canvas-status-floating.status-success {
+    border-color: #10b981;
+    color: #34d399;
+    background: rgba(16, 185, 129, 0.12);
+}
+@keyframes pulse-warning {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
+    50%       { box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.2); }
+}
+
+
+/* Set Center button active state */
+#set-center-btn.active {
+    background: rgba(239, 68, 68, 0.2) !important;
+    border-color: #ef4444 !important;
+    color: #fca5a5 !important;
+    animation: pulse-warning 1.5s ease-in-out infinite;
+}
 
 /* Multi-Target File Queue */
 .queue-item {
