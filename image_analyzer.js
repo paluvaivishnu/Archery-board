@@ -82,8 +82,34 @@ class TargetImageAnalyzer {
         // Saved comparison sessions
         this.sessionsList = [];
 
+        // Content-hash cache for HITL: maps File → Promise<string>
+        this._fileHashCache = new Map();
+
         this.initDatabase();
         this.loadExternalLibraries();
+    }
+
+    // ==========================================================
+    // CONTENT-HASH HELPER  (used for HITL cache keys)
+    // Computes a SHA-256 hash from the first 2KB + last 2KB of the
+    // file so identical images match even if renamed or re-downloaded.
+    // ==========================================================
+    async getFileContentHash(file) {
+        // Return cached hash if we already computed it for this File object
+        if (this._fileHashCache.has(file)) return this._fileHashCache.get(file);
+
+        const chunkSize = 2048;
+        const first = file.slice(0, chunkSize);
+        const last  = file.slice(Math.max(0, file.size - chunkSize));
+        const blob  = new Blob([first, last]);
+        const buf   = await blob.arrayBuffer();
+        const hashBuf = await crypto.subtle.digest('SHA-256', buf);
+        const hash = Array.from(new Uint8Array(hashBuf))
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join('');
+
+        this._fileHashCache.set(file, hash);
+        return hash;
     }
 
     // ==========================================================
@@ -1549,31 +1575,89 @@ y2: ${cand.y2.toFixed(2)}`);
         this.isProcessingQueue = false;
         
         // Restore any cached Human-in-the-Loop manual holes for this specific file
-        const cacheKey = `hitl_cache_${pendingItem.file.name}_${pendingItem.file.size}`;
-        const cached = localStorage.getItem(cacheKey);
-        if (cached) {
-            try {
+        try {
+            const contentHash = await this.getFileContentHash(pendingItem.file);
+            const cacheKey = `hitl_cache_${contentHash}`;
+            const cached = localStorage.getItem(cacheKey);
+            if (cached) {
                 const cachedShots = JSON.parse(cached);
-                if (cachedShots) {
+                if (cachedShots && cachedShots.length > 0) {
                     this.currentSession.shots = cachedShots;
                     this.currentSession.shots.sort((a, b) => b.score - a.score);
+
+                    // Generate the warped base64 image first so that renderWarpedCanvas has a real background image to draw
+                    this.applyPerspectiveWarp();
+
+                    // Re-render UI so restored shots are visible
+                    this.calculateAdvancedStats();
+                    this.calculateConfidenceScores();
+                    this.renderWarpedCanvas();
+                    this.updateStatsUI();
+                    this.renderShotsTableUI();
+                    this.renderPerformanceUI();
+                    console.log(`[HITL] Restored ${cachedShots.length} cached shots (queue path)`);
                 }
-            } catch (e) {
-                console.warn("Failed to parse HITL cache", e);
             }
+        } catch (e) {
+            console.warn("Failed to restore HITL cache (queue path)", e);
         }
 
         // Process next item
         setTimeout(() => this.processNextInQueue(), 100);
     }
 
-    cacheManualHoles() {
+    applyPerspectiveWarp() {
+        if (!this.originalImage || !this.originalMat) return;
+
+        const pins = this.currentSession.calibration.cornerPoints;
+        if (!pins || pins.length !== 4) return;
+
+        const srcPtsData = [];
+        pins.forEach(pin => {
+            srcPtsData.push(pin.x / this.scaleX);
+            srcPtsData.push(pin.y / this.scaleY);
+        });
+
+        const dstPtsData = this.computeProportionalDstPoints(pins);
+
+        let srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, srcPtsData);
+        let dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, dstPtsData);
+
+        let M = cv.getPerspectiveTransform(srcPts, dstPts);
+        
+        if (this.warpedMat) this.warpedMat.delete();
+        this.warpedMat = new cv.Mat();
+        this.cachedBlackRadius = null;
+        this.currentSession.detectedRingRadii = null;
+        this.currentSession._calibratedPixelsPerMm = null;
+        
+        cv.warpPerspective(this.originalMat, this.warpedMat, M, new cv.Size(900, 900));
+
+        srcPts.delete();
+        dstPts.delete();
+        M.delete();
+
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = 900;
+        tempCanvas.height = 900;
+        cv.imshow(tempCanvas, this.warpedMat);
+        this.currentSession.warpedImageBase64 = tempCanvas.toDataURL();
+    }
+
+    async cacheManualHoles() {
         if (!this.currentSession.originalImageBlob) return;
         const file = this.currentSession.originalImageBlob;
-        const cacheKey = `hitl_cache_${file.name}_${file.size}`;
-        
-        // Save the ENTIRE perfectly corrected shots array so deletions are captured too
-        localStorage.setItem(cacheKey, JSON.stringify(this.currentSession.shots));
+
+        try {
+            const contentHash = await this.getFileContentHash(file);
+            const cacheKey = `hitl_cache_${contentHash}`;
+
+            // Save the ENTIRE perfectly corrected shots array so deletions are captured too
+            localStorage.setItem(cacheKey, JSON.stringify(this.currentSession.shots));
+            console.log(`[HITL] Cached ${this.currentSession.shots.length} shots (key=${cacheKey.slice(0,24)}…)`);
+        } catch (e) {
+            console.warn("Failed to cache manual holes", e);
+        }
     }
 
     async processSingleFile(file) {
@@ -1671,7 +1755,70 @@ y2: ${cand.y2.toFixed(2)}`);
             const corners = await this.detectTargetConcentricCircles(this.originalMat);
             if (corners.length === 4) {
                 this.currentSession.calibration.autoDetected = true;
-                this.currentSession.calibration.cornerPoints = corners.map(pt => ({
+
+                // Sub-pixel corner refinement: refine detected corners by finding
+                // the strongest Shi-Tomasi corner feature near each detected point.
+                // cv.cornerSubPix is not available in this OpenCV.js build, so we use
+                // cv.goodFeaturesToTrack on a local ROI around each corner instead.
+                let refinedCorners = corners;
+                try {
+                    let grayForRefine = new cv.Mat();
+                    cv.cvtColor(this.originalMat, grayForRefine, cv.COLOR_RGBA2GRAY);
+
+                    const searchRadius = 15; // pixels to search around each detected corner
+                    refinedCorners = [];
+
+                    for (let i = 0; i < corners.length; i++) {
+                        const pt = corners[i];
+                        // Define ROI around the detected corner, clamped to image bounds
+                        const x0 = Math.max(0, Math.round(pt.x) - searchRadius);
+                        const y0 = Math.max(0, Math.round(pt.y) - searchRadius);
+                        const x1 = Math.min(grayForRefine.cols, Math.round(pt.x) + searchRadius);
+                        const y1 = Math.min(grayForRefine.rows, Math.round(pt.y) + searchRadius);
+                        const roiW = x1 - x0;
+                        const roiH = y1 - y0;
+
+                        if (roiW > 5 && roiH > 5) {
+                            let roi = grayForRefine.roi(new cv.Rect(x0, y0, roiW, roiH));
+                            let localCorners = new cv.Mat();
+
+                            // Find the single strongest corner in the ROI
+                            cv.goodFeaturesToTrack(roi, localCorners, 1, 0.01, 3, new cv.Mat(), 3, false, 0.04);
+
+                            if (localCorners.rows > 0) {
+                                // Map local ROI coordinates back to image coordinates
+                                const rx = localCorners.data32F[0] + x0;
+                                const ry = localCorners.data32F[1] + y0;
+                                // Drift guard: reject if refined corner moved too far (> 10px)
+                                // from the original — prevents snapping to unrelated gradient features
+                                const drift = Math.sqrt((rx - pt.x) ** 2 + (ry - pt.y) ** 2);
+                                if (drift <= 10) {
+                                    refinedCorners.push({ x: rx, y: ry });
+                                } else {
+                                    console.log(`[CornerRefine] Corner ${i} drifted ${drift.toFixed(1)}px — keeping original`);
+                                    refinedCorners.push(pt);
+                                }
+                            } else {
+                                refinedCorners.push(pt); // no better corner found, keep original
+                            }
+
+                            localCorners.delete();
+                            roi.delete();
+                        } else {
+                            refinedCorners.push(pt); // ROI too small, keep original
+                        }
+                    }
+
+                    console.log('[CornerRefine] goodFeaturesToTrack refinement applied:',
+                        corners.map((c, i) => `(${c.x.toFixed(0)},${c.y.toFixed(0)})→(${refinedCorners[i].x.toFixed(2)},${refinedCorners[i].y.toFixed(2)})`).join(', '));
+
+                    grayForRefine.delete();
+                } catch (refineErr) {
+                    console.warn('[CornerRefine] Corner refinement failed, using raw corners:', refineErr.message);
+                    refinedCorners = corners;
+                }
+
+                this.currentSession.calibration.cornerPoints = refinedCorners.map(pt => ({
                     x: Math.round(pt.x * this.scaleX),
                     y: Math.round(pt.y * this.scaleY)
                 }));
@@ -1683,32 +1830,25 @@ y2: ${cand.y2.toFixed(2)}`);
             this.currentSession.calibration.autoDetected = false;
         }
 
-        // Preview Mode: Just show the unwarped image and corner pins overlay
-        this.isCalibrating = true;
-        this.isWarpModeActive = true;
+        // Skip the manual calibration preview — go straight to analysis.
+        // Corners have already been auto-detected and set above.
+        this.isCalibrating = false;
+        this.isWarpModeActive = false;
 
-        // Reset sidebar checkboxes/views
-        const previewCheckbox = document.getElementById('manual-warp-preview');
-        if (previewCheckbox) previewCheckbox.checked = false;
+        // Hide calibration UI elements (no corner pins shown)
+        const pinsContainer = document.getElementById('warp-pins-container');
+        if (pinsContainer) pinsContainer.style.display = 'none';
 
         const previewGroup = document.getElementById('manual-warp-preview-group');
-        if (previewGroup) previewGroup.style.display = 'block';
-
-        const pinsContainer = document.getElementById('warp-pins-container');
-        if (pinsContainer) pinsContainer.style.display = 'block';
+        if (previewGroup) previewGroup.style.display = 'none';
 
         const fallbackSec = document.getElementById('manual-fallback-section');
-        if (fallbackSec) fallbackSec.style.display = 'block';
+        if (fallbackSec) fallbackSec.style.display = 'none';
 
-        // Check the adjust toggle on UI
         const adjustToggle = document.getElementById('adjust-calibration-toggle');
-        if (adjustToggle) adjustToggle.checked = true;
+        if (adjustToggle) adjustToggle.checked = false;
 
-        // Render preview canvas and overlay corners
-        this.renderCalibrationCanvas();
-        this.showCornerPinsOverlay();
-
-        // Update stats table and UI to empty states
+        // Reset stats
         this.currentSession.stats = {
             totalShots: 0,
             totalScore: 0,
@@ -1723,7 +1863,9 @@ y2: ${cand.y2.toFixed(2)}`);
         };
         this.updateStatsUI();
         this.renderShotsTableUI();
-        this.renderPerformanceUI();
+
+        // Automatically run full analysis — no manual step needed.
+        await this.runAnalysis();
     }
 
     async runAnalysis() {
@@ -1748,12 +1890,7 @@ y2: ${cand.y2.toFixed(2)}`);
                 srcPtsData.push(pin.x / this.scaleX);
                 srcPtsData.push(pin.y / this.scaleY);
             });
-            const dstPtsData = [
-                0, 0,
-                900, 0,
-                900, 900,
-                0, 900
-            ];
+            const dstPtsData = this.computeProportionalDstPoints(pins);
 
             let srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, srcPtsData);
             let dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, dstPtsData);
@@ -1802,19 +1939,55 @@ y2: ${cand.y2.toFixed(2)}`);
 
         // Check if there is a saved HITL cache for this image!
         if (this.currentSession.originalImageBlob) {
-            const file = this.currentSession.originalImageBlob;
-            const cacheKey = `hitl_cache_${file.name}_${file.size}`;
-            const cached = localStorage.getItem(cacheKey);
-            if (cached) {
-                try {
+            try {
+                const file = this.currentSession.originalImageBlob;
+                const contentHash = await this.getFileContentHash(file);
+                const cacheKey = `hitl_cache_${contentHash}`;
+                const cached = localStorage.getItem(cacheKey);
+                if (cached) {
                     const cachedShots = JSON.parse(cached);
-                    if (cachedShots) {
+                    if (cachedShots && cachedShots.length > 0) {
+                        // Re-score each cached shot against the current warp geometry
+                        const template = this.getTargetTemplateDetails(this.currentSession.targetType);
+                        for (const shot of cachedShots) {
+                            const scoreObj = this.calculateAnalyticScore(
+                                shot.x, shot.y, template
+                            );
+                            shot.score = scoreObj.score;
+                            shot.distancePx = scoreObj.distancePx;
+                            if (scoreObj.distanceMm !== undefined) {
+                                shot.distanceReal = scoreObj.distanceMm;
+                            }
+                        }
+
                         this.currentSession.shots = cachedShots;
                         this.currentSession.shots.sort((a, b) => b.score - a.score);
+
+                        // Regenerate YOLO detections so restored manual shots still get labels
+                        this.yoloDetections = [];
+                        this.yoloWarpedDetections = this.currentSession.shots.map((shot, idx) => ({
+                            classId: 0,
+                            className: shot.type === "Manual Entry" ? "Manual Hole" : "Hole",
+                            confidence: shot.confidence !== undefined ? (shot.confidence / 100) : 1.0,
+                            x1: (shot.x * 1.8) - 15,
+                            y1: (shot.y * 1.8) - 15,
+                            x2: (shot.x * 1.8) + 15,
+                            y2: (shot.y * 1.8) + 15,
+                            shotIndex: idx
+                        }));
+
+                        // Re-render UI so restored shots are visible
+                        this.calculateAdvancedStats();
+                        this.calculateConfidenceScores();
+                        this.renderWarpedCanvas();
+                        this.updateStatsUI();
+                        this.renderShotsTableUI();
+                        this.renderPerformanceUI();
+                        console.log(`[HITL] Restored & re-scored ${cachedShots.length} cached shots (analysis path)`);
                     }
-                } catch (e) {
-                    console.warn("Failed to parse HITL cache in runAnalysis", e);
                 }
+            } catch (e) {
+                console.warn("Failed to restore HITL cache in runAnalysis", e);
             }
         }
 
@@ -2119,13 +2292,40 @@ y2: ${cand.y2.toFixed(2)}`);
             hierarchy.delete();
             
             if (bestContour) {
-                // Use minEnclosingCircle to get the actual outer boundary radius
+                // Try ellipse fitting first — crucial for angled shots
+                // fitEllipse requires at least 5 points
+                if (bestContour.rows >= 5) {
+                    try {
+                        const ellipse = cv.fitEllipse(bestContour);
+                        const majorAxis = Math.max(ellipse.size.width, ellipse.size.height);
+                        const minorAxis = Math.min(ellipse.size.width, ellipse.size.height);
+                        const aspectRatio = majorAxis / Math.max(minorAxis, 1);
+
+                        if (aspectRatio > 1.15) {
+                            // Angled view detected — return ellipse data for perspective-aware corners
+                            console.log(`[BoardDetect] Yellow mask ellipse: center=(${ellipse.center.x.toFixed(0)},${ellipse.center.y.toFixed(0)}), ` +
+                                `size=(${ellipse.size.width.toFixed(0)}×${ellipse.size.height.toFixed(0)}), angle=${ellipse.angle.toFixed(1)}°, aspect=${aspectRatio.toFixed(2)}`);
+                            bestContour.delete();
+                            return {
+                                cx: ellipse.center.x,
+                                cy: ellipse.center.y,
+                                r: majorAxis / 2,
+                                ellipse: ellipse, // { center, size, angle }
+                                isElliptical: true
+                            };
+                        }
+                    } catch (ellipseErr) {
+                        console.warn("Ellipse fitting failed, falling back to circle:", ellipseErr);
+                    }
+                }
+
+                // Straight-on view — use circle as before
                 let circle = cv.minEnclosingCircle(bestContour);
                 const cx = circle.center.x;
                 const cy = circle.center.y;
                 const r  = circle.radius;
                 bestContour.delete();
-                console.log(`[BoardDetect] Yellow mask: center=(${cx.toFixed(0)},${cy.toFixed(0)}), radius=${r.toFixed(0)}px`);
+                console.log(`[BoardDetect] Yellow mask circle: center=(${cx.toFixed(0)},${cy.toFixed(0)}), radius=${r.toFixed(0)}px`);
                 return { cx, cy, r };
             }
         } catch (err) {
@@ -2218,19 +2418,52 @@ y2: ${cand.y2.toFixed(2)}`);
     }
 
     async detectTargetConcentricCircles(mat) {
-        let target = null;
-        
-        // Priority 2: HSV yellow mask centroid (for color archery targets)
-        if (!target) {
-            target = this.detectTargetYellowCentroidAndRadius(mat);
+        // =============================================================
+        // PRIORITY 1: Contour quad detection (best for angled shots)
+        // Finds the rectangular target paper boundary directly — this
+        // naturally captures perspective distortion as a trapezoid.
+        // =============================================================
+        let quadCorners = this._detectTargetQuadContour(mat);
+        if (quadCorners && quadCorners.length === 4) {
+            // Check whether the quad is actually perspective-distorted (trapezoid)
+            // or just a straight-on rectangle. For straight photos, the paper boundary
+            // is a rectangle with all angles ≈ 90°. Using it would apply a non-square
+            // proportional warp that distorts the circular target rings.
+            const isTrapezoidal = this._isQuadTrapezoidal(quadCorners);
+            if (isTrapezoidal) {
+                console.log('[BoardDetect] Using QUAD detection (Priority 1) — angled/trapezoidal quad');
+                return this.sortCornersClockwise(quadCorners);
+            } else {
+                console.log('[BoardDetect] Quad detected but near-rectangular (straight photo) — skipping to circle detection');
+            }
         }
 
-        // Priority 3: Concentric Hough circle group voting (fallback)
+        // =============================================================
+        // PRIORITY 2: Ellipse fitting from HSV yellow mask
+        // If the target region is detected as an ellipse (aspect > 1.15),
+        // compute 4 corners from the ellipse's oriented bounding box.
+        // This handles cases where the paper boundary isn't visible but
+        // the concentric rings form a visible ellipse.
+        // =============================================================
+        let target = this.detectTargetYellowCentroidAndRadius(mat);
+
+        if (target && target.isElliptical && target.ellipse) {
+            const e = target.ellipse;
+            // Get the 4 corners of the rotated bounding rectangle of the ellipse
+            const corners = this._ellipseToCorners(e);
+            console.log('[BoardDetect] Using ELLIPSE detection (Priority 2)');
+            return this.sortCornersClockwise(corners);
+        }
+
+        // =============================================================
+        // PRIORITY 3: Circle-based detection (straight-on shots)
+        // Yellow centroid circle or HoughCircles → square bounding box.
+        // Only suitable for straight-on / near-straight shots.
+        // =============================================================
         if (!target) {
             target = this.detectTargetClassical(mat);
         }
 
-        // If target center and radius was successfully found
         if (target) {
             const { cx, cy, r } = target;
             const corners = [
@@ -2239,65 +2472,188 @@ y2: ${cand.y2.toFixed(2)}`);
                 { x: cx + r, y: cy + r }, // Bottom-Right
                 { x: cx - r, y: cy + r }  // Bottom-Left
             ];
+            console.log('[BoardDetect] Using CIRCLE detection (Priority 3)');
             return corners;
         }
 
-        // Rescale, blur, and run contour fitting
+        console.warn('[BoardDetect] All auto-detection strategies failed, using default corners.');
+        return [];
+    }
+
+    // Helper: Extract 4 corners from an OpenCV RotatedRect (ellipse result)
+    _ellipseToCorners(ellipse) {
+        const cx = ellipse.center.x;
+        const cy = ellipse.center.y;
+        const halfW = ellipse.size.width / 2;
+        const halfH = ellipse.size.height / 2;
+        const angleRad = (ellipse.angle * Math.PI) / 180;
+        const cosA = Math.cos(angleRad);
+        const sinA = Math.sin(angleRad);
+
+        // 4 corners of the oriented bounding box
+        const offsets = [
+            { dx: -halfW, dy: -halfH }, // TL in local space
+            { dx:  halfW, dy: -halfH }, // TR
+            { dx:  halfW, dy:  halfH }, // BR
+            { dx: -halfW, dy:  halfH }  // BL
+        ];
+
+        return offsets.map(({ dx, dy }) => ({
+            x: cx + dx * cosA - dy * sinA,
+            y: cy + dx * sinA + dy * cosA
+        }));
+    }
+
+    // Helper: Contour-based quad (rectangle) detection
+    _detectTargetQuadContour(mat) {
         let gray = new cv.Mat();
         let blurred = new cv.Mat();
+        let enhanced = new cv.Mat();
         let thresh = new cv.Mat();
-        
-        cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
-        cv.GaussianBlur(gray, blurred, new cv.Size(7, 7), 0);
-        cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 41, 11);
-
-        let contours = new cv.MatVector();
-        let hierarchy = new cv.Mat();
-        cv.findContours(thresh, contours, hierarchy, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
-
-        let bestContourIdx = -1;
-        let maxArea = 0;
         let detectedCorners = [];
 
-        for (let i = 0; i < contours.size(); i++) {
-            let contour = contours.get(i);
-            let area = cv.contourArea(contour);
-            
-            // Look for target card backing / concentric outline (must be large)
-            if (area > 30000 && area > maxArea) {
-                let perimeter = cv.arcLength(contour, true);
-                let approx = new cv.Mat();
-                cv.approxPolyDP(contour, approx, 0.03 * perimeter, true);
-                
-                // If it is a quad target square backing
-                if (approx.rows === 4) {
-                    maxArea = area;
-                    bestContourIdx = i;
-                    detectedCorners = [];
-                    for (let j = 0; j < 4; j++) {
-                        detectedCorners.push({
-                            x: approx.data32S[j * 2],
-                            y: approx.data32S[j * 2 + 1]
-                        });
+        try {
+            cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+
+            // Apply CLAHE (Contrast-Limited Adaptive Histogram Equalization)
+            // to improve edge detection on angled images with uneven lighting/shadows
+            try {
+                const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+                clahe.apply(gray, enhanced);
+                clahe.delete();
+            } catch (claheErr) {
+                // CLAHE may not be available in all OpenCV.js builds — fall back to raw gray
+                console.warn('[QuadDetect] CLAHE not available, using raw grayscale:', claheErr.message);
+                gray.copyTo(enhanced);
+            }
+
+            cv.GaussianBlur(enhanced, blurred, new cv.Size(7, 7), 0);
+            cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 41, 11);
+
+            let contours = new cv.MatVector();
+            let hierarchy = new cv.Mat();
+            cv.findContours(thresh, contours, hierarchy, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
+
+            // Proportional minimum area: 5% of image area (handles different resolutions)
+            const minAreaThreshold = mat.rows * mat.cols * 0.05;
+            let maxArea = 0;
+
+            // Multi-epsilon polygon approximation: try progressively looser epsilons
+            // to handle angled images where contour curves prevent exact 4-vertex match
+            const epsilons = [0.02, 0.03, 0.04, 0.05, 0.06];
+
+            for (let i = 0; i < contours.size(); i++) {
+                let contour = contours.get(i);
+                let area = cv.contourArea(contour);
+
+                if (area > minAreaThreshold && area > maxArea) {
+                    let perimeter = cv.arcLength(contour, true);
+
+                    for (const eps of epsilons) {
+                        let approx = new cv.Mat();
+                        cv.approxPolyDP(contour, approx, eps * perimeter, true);
+
+                        if (approx.rows === 4) {
+                            // Validate convexity — reject self-intersecting quads
+                            const corners = [];
+                            for (let j = 0; j < 4; j++) {
+                                corners.push({
+                                    x: approx.data32S[j * 2],
+                                    y: approx.data32S[j * 2 + 1]
+                                });
+                            }
+
+                            // Check convexity via cross products (all same sign)
+                            let isConvex = true;
+                            let sign = 0;
+                            for (let j = 0; j < 4; j++) {
+                                const p0 = corners[j];
+                                const p1 = corners[(j + 1) % 4];
+                                const p2 = corners[(j + 2) % 4];
+                                const cross = (p1.x - p0.x) * (p2.y - p1.y) - (p1.y - p0.y) * (p2.x - p1.x);
+                                if (sign === 0) sign = Math.sign(cross);
+                                else if (Math.sign(cross) !== sign && Math.abs(cross) > 100) {
+                                    isConvex = false;
+                                    break;
+                                }
+                            }
+
+                            // Validate minimum interior angles (reject degenerate quads)
+                            let minAngle = 180;
+                            for (let j = 0; j < 4; j++) {
+                                const p0 = corners[j];
+                                const p1 = corners[(j + 1) % 4];
+                                const p2 = corners[(j + 2) % 4];
+                                const v1 = { x: p0.x - p1.x, y: p0.y - p1.y };
+                                const v2 = { x: p2.x - p1.x, y: p2.y - p1.y };
+                                const dot = v1.x * v2.x + v1.y * v2.y;
+                                const mag1 = Math.sqrt(v1.x * v1.x + v1.y * v1.y);
+                                const mag2 = Math.sqrt(v2.x * v2.x + v2.y * v2.y);
+                                if (mag1 > 0 && mag2 > 0) {
+                                    const cosAngle = Math.max(-1, Math.min(1, dot / (mag1 * mag2)));
+                                    const angle = Math.acos(cosAngle) * 180 / Math.PI;
+                                    minAngle = Math.min(minAngle, angle);
+                                }
+                            }
+
+                            if (isConvex && minAngle > 30) {
+                                maxArea = area;
+                                detectedCorners = corners;
+                                console.log(`[QuadDetect] Found quad with eps=${eps}, area=${area.toFixed(0)}, minAngle=${minAngle.toFixed(1)}°`);
+                                approx.delete();
+                                break; // accept first valid epsilon
+                            }
+                        }
+                        approx.delete();
                     }
                 }
-                approx.delete();
+                contour.delete();
             }
-            contour.delete();
+
+            contours.delete();
+            hierarchy.delete();
+        } catch (err) {
+            console.warn("Quad contour detection failed:", err);
+        } finally {
+            gray.delete();
+            blurred.delete();
+            enhanced.delete();
+            thresh.delete();
         }
 
-        gray.delete();
-        blurred.delete();
-        thresh.delete();
-        contours.delete();
-        hierarchy.delete();
+        return detectedCorners.length === 4 ? detectedCorners : null;
+    }
 
-        // Sort corners clockwise starting from Top-Left
-        if (detectedCorners.length === 4) {
-            return this.sortCornersClockwise(detectedCorners);
+    // Helper: Determine if a detected quad is perspective-distorted (trapezoid)
+    // or a near-perfect rectangle (straight-on photo).
+    // Returns true if any interior angle deviates more than 15° from 90°,
+    // indicating genuine perspective distortion that warrants quad-based warping.
+    _isQuadTrapezoidal(corners) {
+        if (!corners || corners.length !== 4) return false;
+
+        const angleTolerance = 15; // degrees of deviation from 90° allowed
+        let maxDeviation = 0;
+
+        for (let j = 0; j < 4; j++) {
+            const p0 = corners[j];
+            const p1 = corners[(j + 1) % 4];
+            const p2 = corners[(j + 2) % 4];
+            const v1 = { x: p0.x - p1.x, y: p0.y - p1.y };
+            const v2 = { x: p2.x - p1.x, y: p2.y - p1.y };
+            const dot = v1.x * v2.x + v1.y * v2.y;
+            const mag1 = Math.sqrt(v1.x * v1.x + v1.y * v1.y);
+            const mag2 = Math.sqrt(v2.x * v2.x + v2.y * v2.y);
+            if (mag1 > 0 && mag2 > 0) {
+                const cosAngle = Math.max(-1, Math.min(1, dot / (mag1 * mag2)));
+                const angle = Math.acos(cosAngle) * 180 / Math.PI;
+                const deviation = Math.abs(angle - 90);
+                maxDeviation = Math.max(maxDeviation, deviation);
+            }
         }
 
-        return [];
+        const isTrapezoidal = maxDeviation > angleTolerance;
+        console.log(`[QuadAngle] Max angle deviation from 90°: ${maxDeviation.toFixed(1)}° → ${isTrapezoidal ? 'TRAPEZOIDAL (angled)' : 'RECTANGULAR (straight)'}`);
+        return isTrapezoidal;
     }
 
     sortCornersClockwise(pts) {
@@ -2323,12 +2679,7 @@ y2: ${cand.y2.toFixed(2)}`);
             srcPtsData.push(pin.y / this.scaleY);
         });
 
-        const dstPtsData = [
-            0, 0,
-            900, 0,
-            900, 900,
-            0, 900
-        ];
+        const dstPtsData = this.computeProportionalDstPoints(pins);
 
         let srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, srcPtsData);
         let dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, dstPtsData);
@@ -2508,7 +2859,9 @@ y2: ${cand.y2.toFixed(2)}`);
                 } else if (circularity < minCircularity) {
                     accepted = false;
                     rejectedReason = "circularity";
-                } else if (aspect < 0.5 || aspect > 2.0) {
+                } else if (aspect < 0.60 || aspect > 1.67) {
+                    // Tighter aspect ratio: printed numbers like '1' are very tall/narrow.
+                    // A genuine bullet hole is roughly circular (aspect close to 1.0).
                     accepted = false;
                     rejectedReason = "aspect";
                 } else if (solidity < 0.65) {
@@ -2802,6 +3155,105 @@ y2: ${cand.y2.toFixed(2)}`);
         });
         M.delete();
     }
+    validateYOLODetectionPatch(det, originalMat) {
+        if (!originalMat || originalMat.empty()) return true;
+
+        const cols = originalMat.cols;
+        const rows = originalMat.rows;
+
+        // Ensure bounding box coordinates are within bounds
+        const x1 = Math.max(0, Math.min(cols - 1, Math.round(det.x1)));
+        const y1 = Math.max(0, Math.min(rows - 1, Math.round(det.y1)));
+        const x2 = Math.max(0, Math.min(cols - 1, Math.round(det.x2)));
+        const y2 = Math.max(0, Math.min(rows - 1, Math.round(det.y2)));
+
+        const w = x2 - x1;
+        const h = y2 - y1;
+        if (w < 4 || h < 4) return false;
+
+        let gray = new cv.Mat();
+        let roi = null;
+        try {
+            cv.cvtColor(originalMat, gray, cv.COLOR_RGBA2GRAY);
+            let rect = new cv.Rect(x1, y1, w, h);
+            let tempRoi = gray.roi(rect);
+            roi = tempRoi.clone(); // Cloned ROI is contiguous in memory
+            tempRoi.delete();
+
+            let minMax = cv.minMaxLoc(roi);
+            const minVal = minMax.minVal;
+            const maxVal = minMax.maxVal;
+
+            // Calculate border mean brightness
+            let borderSum = 0;
+            let borderCount = 0;
+            const data = roi.data;
+            for (let col = 0; col < w; col++) {
+                borderSum += data[col]; // top row
+                borderSum += data[(h - 1) * w + col]; // bottom row
+                borderCount += 2;
+            }
+            for (let row = 1; row < h - 1; row++) {
+                borderSum += data[row * w]; // left col
+                borderSum += data[row * w + (w - 1)]; // right col
+                borderCount += 2;
+            }
+            const borderMean = borderSum / borderCount;
+
+            console.log(`[PatchValidation] box=[${x1},${y1},${x2},${y2}] borderMean=${borderMean.toFixed(1)} minVal=${minVal} maxVal=${maxVal}`);
+
+            // Compute center 40% area mean brightness (used in both dark and light area checks)
+            const cx_start = Math.round(w * 0.3);
+            const cx_end = Math.round(w * 0.7);
+            const cy_start = Math.round(h * 0.3);
+            const cy_end = Math.round(h * 0.7);
+
+            let centerSum = 0;
+            let centerCount = 0;
+            for (let r = cy_start; r < cy_end; r++) {
+                for (let c = cx_start; c < cx_end; c++) {
+                    centerSum += data[r * w + c];
+                    centerCount++;
+                }
+            }
+            const centerMean = centerCount > 0 ? centerSum / centerCount : borderMean;
+
+            // Case 1: Dark background (e.g. black rings 7-10)
+            if (borderMean < 90) {
+                // White printed digits (like '8', '9') on dark backgrounds have bright maxVal
+                // but their center pixels follow the surrounding bright ink — not a deep dark hole.
+                // A real bullet hole punches through and looks uniformly dark even in center.
+                if (maxVal > 160 && centerMean > borderMean * 0.85) {
+                    console.log(`[PatchValidation] Rejected in dark area: maxVal=${maxVal} and centerMean=${centerMean.toFixed(1)} not dark vs borderMean=${borderMean.toFixed(1)} (likely white printed digit)`);
+                    return false;
+                }
+            }
+
+            // Case 2: Light background (e.g. white/beige rings 1-6)
+            if (borderMean >= 90) {
+                // A real hole must have some dark pixels compared to background
+                if (minVal > borderMean - 25) {
+                    console.log(`[PatchValidation] Rejected detection in light area: minVal=${minVal} > borderMean-25=${(borderMean - 25).toFixed(1)} (not dark enough)`);
+                    return false;
+                }
+
+                // Center should be dark — printed digit loops ('0', '6', '8', '9') have a
+                // light interior matching the paper background, unlike real holes which are dark.
+                if (centerMean > borderMean * 0.85) {
+                    console.log(`[PatchValidation] Rejected detection in light area: centerMean=${centerMean.toFixed(1)} vs borderMean=${borderMean.toFixed(1)} (center not dark enough, likely printed digit/text loop)`);
+                    return false;
+                }
+            }
+
+            return true;
+        } catch (err) {
+            console.warn("[PatchValidation] Error validating patch, defaulting to true:", err);
+            return true;
+        } finally {
+            if (roi) roi.delete();
+            gray.delete();
+        }
+    }
 
     debugYOLOPipeline(detections, engine, M) {
         if (!detections) detections = [];
@@ -2814,7 +3266,11 @@ y2: ${cand.y2.toFixed(2)}`);
             const name = (det.className || "").toLowerCase();
             const isValid = name === 'hole' || name === 'hit' || name === 'bullet-holes';
             if (isValid) {
-                afterAccepted.push(det);
+                if (this.validateYOLODetectionPatch(det, this.originalMat)) {
+                    afterAccepted.push(det);
+                } else {
+                    console.log(`[PatchValidation] Filtered out false positive YOLO detection at center=(${det.xc.toFixed(1)}, ${det.yc.toFixed(1)})`);
+                }
             } else {
                 console.log(`Rejected hole:\ncenter=(${det.xc.toFixed(1)}, ${det.yc.toFixed(1)})\nconfidence=${(det.confidence * 100).toFixed(0)}%\nreason=validation failed`);
             }
@@ -2956,15 +3412,88 @@ y2: ${cand.y2.toFixed(2)}`);
         }
 
         // FIX 4: Validate warp quality and show a warning badge if distorted
+        // If warp is poor, attempt auto-fix using quad/ellipse fallback corners
         if (this.warpedMat && !this.warpedMat.empty()) {
             const warpCheck = this.validateWarpQuality(template);
-            const statusBadge = document.getElementById('analyzer-canvas-badge');
-            const statusText  = document.getElementById('analyzer-status-badge-text');
-            if (!warpCheck.valid && statusBadge && statusText) {
-                statusText.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> Warp Warning: ${warpCheck.reason}`;
-                statusBadge.className = 'canvas-status-floating status-warning';
-                statusBadge.style.display = 'block';
-                console.warn('[WarpQuality]', warpCheck.reason);
+            if (!warpCheck.valid) {
+                console.warn('[WarpQuality] Initial warp failed:', warpCheck.reason);
+
+                // AUTO-FIX: Try alternative detection strategies
+                let autoFixed = false;
+                const origCorners = [...this.currentSession.calibration.cornerPoints];
+
+                // Try quad contour detection as fallback
+                const quadCorners = this._detectTargetQuadContour(this.originalMat);
+                if (quadCorners && quadCorners.length === 4) {
+                    const sorted = this.sortCornersClockwise(quadCorners);
+                    const scaledCorners = sorted.map(pt => ({
+                        x: Math.round(pt.x * this.scaleX),
+                        y: Math.round(pt.y * this.scaleY)
+                    }));
+                    this.currentSession.calibration.cornerPoints = scaledCorners;
+
+                    // Re-warp with new corners
+                    const srcPtsData2 = [];
+                    scaledCorners.forEach(pin => {
+                        srcPtsData2.push(pin.x / this.scaleX);
+                        srcPtsData2.push(pin.y / this.scaleY);
+                    });
+                    let srcPts2 = cv.matFromArray(4, 1, cv.CV_32FC2, srcPtsData2);
+                    let dstPts2 = cv.matFromArray(4, 1, cv.CV_32FC2, this.computeProportionalDstPoints(scaledCorners));
+                    let M2 = cv.getPerspectiveTransform(srcPts2, dstPts2);
+                    if (this.warpedMat) this.warpedMat.delete();
+                    this.warpedMat = new cv.Mat();
+                    this.cachedBlackRadius = null;
+                    this.currentSession.detectedRingRadii = null;
+                    this.currentSession._calibratedPixelsPerMm = null;
+                    cv.warpPerspective(this.originalMat, this.warpedMat, M2, new cv.Size(900, 900));
+                    srcPts2.delete(); dstPts2.delete(); M2.delete();
+
+                    const recheck = this.validateWarpQuality(template);
+                    if (recheck.valid) {
+                        autoFixed = true;
+                        console.log('[WarpQuality] Auto-fixed using QUAD contour corners.');
+                    } else {
+                        // Revert to original corners if quad didn't help either
+                        this.currentSession.calibration.cornerPoints = origCorners;
+                        
+                        // Revert warpedMat to original warp as well
+                        const srcPtsDataRevert = [];
+                        origCorners.forEach(pin => {
+                            srcPtsDataRevert.push(pin.x / this.scaleX);
+                            srcPtsDataRevert.push(pin.y / this.scaleY);
+                        });
+                        let srcPtsR = cv.matFromArray(4, 1, cv.CV_32FC2, srcPtsDataRevert);
+                        let dstPtsR = cv.matFromArray(4, 1, cv.CV_32FC2, this.computeProportionalDstPoints(origCorners));
+                        let MR = cv.getPerspectiveTransform(srcPtsR, dstPtsR);
+                        if (this.warpedMat) this.warpedMat.delete();
+                        this.warpedMat = new cv.Mat();
+                        cv.warpPerspective(this.originalMat, this.warpedMat, MR, new cv.Size(900, 900));
+                        srcPtsR.delete(); dstPtsR.delete(); MR.delete();
+                    }
+                    
+                    // Update the cached base64 image to reflect the final warp state (either fixed or reverted)
+                    if (this.warpedMat && !this.warpedMat.empty()) {
+                        const tempCanvas = document.createElement('canvas');
+                        tempCanvas.width = 900;
+                        tempCanvas.height = 900;
+                        cv.imshow(tempCanvas, this.warpedMat);
+                        this.currentSession.warpedImageBase64 = tempCanvas.toDataURL();
+                    }
+                }
+
+                // Show warning if auto-fix also failed
+                if (!autoFixed) {
+                    const statusBadge = document.getElementById('analyzer-canvas-badge');
+                    const statusText  = document.getElementById('analyzer-status-badge-text');
+                    if (statusBadge && statusText) {
+                        statusText.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> Warp Warning: ${warpCheck.reason} ` +
+                            `<br><small>💡 Tip: Use "Adjust Calibration Corners" to manually position the 4 corner pins on the target edges.</small>`;
+                        statusBadge.className = 'canvas-status-floating status-warning';
+                        statusBadge.style.display = 'block';
+                    }
+                    console.warn('[WarpQuality] Auto-fix failed. User should manually adjust corner pins.');
+                }
             }
         }
 
@@ -3035,12 +3564,7 @@ y2: ${cand.y2.toFixed(2)}`);
             srcPtsData.push(pin.y / this.scaleY);
         });
 
-        const dstPtsData = [
-            0, 0,
-            900, 0,
-            900, 900,
-            0, 900
-        ];
+        const dstPtsData = this.computeProportionalDstPoints(pins);
 
         let srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, srcPtsData);
         let dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, dstPtsData);
@@ -3049,6 +3573,30 @@ y2: ${cand.y2.toFixed(2)}`);
         srcPts.delete();
         dstPts.delete();
         return M;
+    }
+
+    // ==========================================================
+    // PROPORTIONAL WARP DESTINATION POINTS
+    // When the detected quad is rectangular (not square), naive 900×900
+    // warping stretches the image non-uniformly, distorting the circular
+    // target rings into ellipses. This method computes adjusted destination
+    // points that effectively:
+    //   1. Warp the trapezoid to a correctly-proportioned rectangle
+    //   2. Center-crop the square region containing the circular target
+    // The result is a single homography that produces a 900×900 output
+    // where circles remain circles.
+    // ==========================================================
+    computeProportionalDstPoints(pins) {
+        if (!pins || pins.length !== 4) {
+            return [0, 0, 900, 0, 900, 900, 0, 900];
+        }
+
+        // Always map to the full 900×900 output canvas so nothing is ever cropped.
+        // Previous logic computed "proportional offsets" for portrait/landscape targets that
+        // pushed warp corners outside the 900px boundary, effectively cutting the top/bottom
+        // (or left/right) of the image. Returning a flat 900×900 rectangle ensures the
+        // entire target — including outer ring numbers — is always fully visible.
+        return [0, 0, 900, 0, 900, 900, 0, 900];
     }
 
     drawMatToCanvas(mat, canvas) {
@@ -3295,16 +3843,17 @@ y2: ${cand.y2.toFixed(2)}`);
             ctx.fill();
 
             // Draw label
-            const displayName = this.yoloConfig.classDisplayNames[det.className] || det.className || "Hole";
-            let labelText = `${displayName} ${Math.round(det.confidence * 100)}%`;
+            let labelText = "";
             if (det.shotIndex !== undefined && det.shotIndex >= 0) {
-                labelText = `Shot ${det.shotIndex + 1} | ${labelText}`;
+                labelText = `Shot ${det.shotIndex + 1}`;
+            } else {
+                labelText = `Hole`;
             }
             
-            ctx.font = 'bold 9px var(--font-mono, monospace)';
+            ctx.font = 'bold 16px monospace';
             const textWidth = ctx.measureText(labelText).width;
-            const tagHeight = 14;
-            const tagWidth = textWidth + 6;
+            const tagHeight = 22;
+            const tagWidth = textWidth + 8;
             const tagX = det.x1;
             let tagY = det.y1 - tagHeight;
             if (tagY < 0) {
@@ -3323,7 +3872,7 @@ y2: ${cand.y2.toFixed(2)}`);
 
             // Tag text
             ctx.fillStyle = '#ffffff';
-            ctx.fillText(labelText, tagX + 3, tagY + 10);
+            ctx.fillText(labelText, tagX + 4, tagY + 14);
         });
 
         ctx.restore();
@@ -3509,41 +4058,36 @@ y2: ${cand.y2.toFixed(2)}`);
         if (yoloImpactConf >= 0) { combinedConf += yoloImpactConf; parts++; }
         combinedConf = parts > 0 ? Math.round(combinedConf / parts) : 0;
 
-        const targetEl = document.getElementById('confidence-target');
-        const perpEl = document.getElementById('confidence-perspective');
-        const impactEl = document.getElementById('confidence-impact');
-        const yoloEl = document.getElementById('confidence-yolo');
-        const combinedEl = document.getElementById('confidence-combined');
 
-        const applyBadgeStyle = (el, val) => {
-            if (!el) return;
-            el.style.color = ""; // reset inline style
-            if (val < 0) {
-                el.textContent = "N/A";
-                el.className = "";
-                el.style.color = "#9ca3af";
-                return;
-            }
-            el.textContent = `${val}%`;
-            el.className = "";
-            if (val >= 90) el.classList.add('high');
-            else if (val >= 70) el.classList.add('med');
-            else el.classList.add('low');
-        };
 
-        if (calMode === 'auto' && !this.currentSession.calibration.autoDetected) {
-            if (targetEl) {
-                targetEl.textContent = "Fail (0%)";
-                targetEl.className = "low";
-                targetEl.style.color = "";
+        // Surface warp quality warning in the dedicated banner
+        const warpWarningEl = document.getElementById('warp-quality-warning');
+        const warpWarningTextEl = document.getElementById('warp-quality-warning-text');
+        if (warpWarningEl) {
+            let showWarning = false;
+            let warningText = '';
+
+            // Show warning if perspective confidence is below threshold
+            if (perspectiveConf > 0 && perspectiveConf < 75) {
+                showWarning = true;
+                warningText = `Perspective warp confidence is low (${perspectiveConf}%). The target corners may not be accurately positioned.`;
             }
-        } else {
-            applyBadgeStyle(targetEl, targetConf);
+
+            // Also check ring spacing uniformity if warpedMat is available
+            if (this.warpedMat && !this.warpedMat.empty()) {
+                const template = this.getTargetTemplateDetails(this.currentSession.targetType);
+                const warpCheck = this.validateWarpQuality(template);
+                if (!warpCheck.valid) {
+                    showWarning = true;
+                    warningText = warpCheck.reason;
+                }
+            }
+
+            warpWarningEl.style.display = showWarning ? 'block' : 'none';
+            if (warpWarningTextEl && warningText) {
+                warpWarningTextEl.textContent = warningText;
+            }
         }
-        applyBadgeStyle(perpEl, perspectiveConf);
-        applyBadgeStyle(impactEl, cvImpactConf);
-        applyBadgeStyle(yoloEl, yoloImpactConf);
-        applyBadgeStyle(combinedEl, combinedConf);
     }
 
     getProportionalMapping() {
@@ -4164,6 +4708,7 @@ y2: ${cand.y2.toFixed(2)}`);
     // VISUAL RENDERING CANVAS OVERLAYS
     // ==========================================================
     renderWarpedCanvas() {
+        console.log('[DEBUG-RENDER] renderWarpedCanvas called! isWarpModeActive:', this.isWarpModeActive, 'isCalibrating:', this.isCalibrating, 'hasWarpedBase64:', !!this.currentSession.warpedImageBase64);
         const canvas = document.getElementById('analyzer-canvas');
         const ctx = canvas.getContext('2d');
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -4301,10 +4846,10 @@ y2: ${cand.y2.toFixed(2)}`);
             ctx.shadowColor = 'black';
             ctx.shadowBlur = 4;
             
-            let labelText = `${idx + 1}`;
-            if (showScores) labelText += ` (${shot.score.toFixed(1)})`;
+            let labelText = "";
+            if (showScores) labelText = `${shot.score.toFixed(1)}`;
 
-            ctx.font = 'bold 10px var(--font-mono)';
+            ctx.font = 'bold 16px monospace';
             ctx.fillStyle = '#ffffff';
             ctx.textAlign = 'left';
             ctx.fillText(labelText, hx + shot.radius * 1.8 + 5, hy - 5);
@@ -4344,6 +4889,7 @@ y2: ${cand.y2.toFixed(2)}`);
     }
 
     renderCalibrationCanvas() {
+        console.log('[DEBUG-RENDER] renderCalibrationCanvas called! isWarpModeActive:', this.isWarpModeActive, 'isCalibrating:', this.isCalibrating, 'originalImage:', !!this.originalImage);
         const canvas = document.getElementById('analyzer-canvas');
         const ctx = canvas.getContext('2d');
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -4517,8 +5063,12 @@ y2: ${cand.y2.toFixed(2)}`);
     }
 
     runComparison() {
-        const idA = document.getElementById('compare-session-a').value;
-        const idB = document.getElementById('compare-session-b').value;
+        const selectA = document.getElementById('compare-session-a');
+        const selectB = document.getElementById('compare-session-b');
+        if (!selectA || !selectB) return;
+
+        const idA = selectA.value;
+        const idB = selectB.value;
 
         if (!idA || !idB) {
             alert("Please select both Baseline and Comparison sessions.");
@@ -4636,6 +5186,7 @@ y2: ${cand.y2.toFixed(2)}`);
 
     drawComparisonVectorChart(sessionA, sessionB) {
         const canvas = document.getElementById('comparison-chart');
+        if (!canvas) return;
         const ctx = canvas.getContext('2d');
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -4902,11 +5453,7 @@ y2: ${cand.y2.toFixed(2)}`);
     }
 
     renderPerformanceUI() {
-        const total = performance.now() - this.perf.startTime;
-        document.getElementById('perf-total-time').textContent = `${Math.round(total)} ms`;
-        document.getElementById('perf-opencv-time').textContent = `${Math.round(this.perf.opencvTime)} ms`;
-        document.getElementById('perf-render-time').textContent = `${Math.round(this.perf.renderTime)} ms`;
-        document.getElementById('perf-shots-count').textContent = this.perf.detectedCount;
+        // No-op (benchmarks panel removed)
     }
 
     updateStatsUI() {
@@ -4918,43 +5465,7 @@ y2: ${cand.y2.toFixed(2)}`);
         document.getElementById('analyzer-stat-total-shots').textContent = s.totalShots;
         document.getElementById('analyzer-stat-total-score').textContent = s.totalScore.toFixed(2);
         document.getElementById('analyzer-stat-avg-score').textContent = s.avgScore.toFixed(2);
-        
-        const unitName = document.getElementById('unit-system').value;
-        const scale = this.getUnitConversionFactor(unitName);
-
-        document.getElementById('analyzer-stat-extreme-spread').textContent = `${(s.extremeSpread * scale).toFixed(1)} ${unitName}`;
-        document.getElementById('analyzer-stat-mean-radius').textContent = `${(s.meanRadius * scale).toFixed(1)} ${unitName}`;
-        document.getElementById('analyzer-stat-cep').textContent = `${(s.cep * scale).toFixed(1)} ${unitName}`;
-        
-        const windSign = s.windage >= 0 ? '+' : '';
-        const elevSign = s.elevation >= 0 ? '+' : '';
-        document.getElementById('analyzer-stat-windage').textContent = `X: ${windSign}${(s.windage * scale).toFixed(1)} ${unitName}`;
-        document.getElementById('analyzer-stat-elevation').textContent = `Y: ${elevSign}${(s.elevation * scale).toFixed(1)} ${unitName}`;
         document.getElementById('analyzer-stat-minmax').textContent = `${s.minScore.toFixed(1)} - ${s.maxScore.toFixed(1)}`;
-
-        // Calculate pipeline confidence average
-        let averageConf = 100;
-        if (s.totalShots > 0) {
-            let sumConf = 0;
-            this.currentSession.shots.forEach(sh => sumConf += sh.confidence);
-            averageConf = Math.round(sumConf / s.totalShots);
-        }
-
-        const gauge = document.getElementById('analyzer-reliability-val');
-        const box = document.getElementById('analyzer-reliability-box');
-        gauge.textContent = `${averageConf}%`;
-
-        // Color coding
-        if (averageConf >= 90) {
-            box.style.background = "rgba(16,185,129,0.15)";
-            box.style.color = "#10b981";
-        } else if (averageConf >= 70) {
-            box.style.background = "rgba(245,158,11,0.15)";
-            box.style.color = "#f59e0b";
-        } else {
-            box.style.background = "rgba(239,68,68,0.15)";
-            box.style.color = "#ef4444";
-        }
     }
 
     getUnitConversionFactor(unit) {
@@ -5052,6 +5563,46 @@ y2: ${cand.y2.toFixed(2)}`);
 
 // Global initialization
 document.addEventListener('DOMContentLoaded', () => {
+    // Redirect console logs to node server for debugging
+    const originalLog = console.log;
+    const originalWarn = console.warn;
+    const originalError = console.error;
+
+    function sendLogToServer(type, args) {
+        const serializedArgs = args.map(arg => {
+            if (arg instanceof Error) {
+                return { message: arg.message, stack: arg.stack };
+            }
+            if (typeof arg === 'object') {
+                try {
+                    return JSON.parse(JSON.stringify(arg));
+                } catch (e) {
+                    return '[Unserializable Object]';
+                }
+            }
+            return arg;
+        });
+
+        fetch('/log', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type, args: serializedArgs })
+        }).catch(() => {});
+    }
+
+    console.log = (...args) => {
+        originalLog(...args);
+        sendLogToServer('log', args);
+    };
+    console.warn = (...args) => {
+        originalWarn(...args);
+        sendLogToServer('warn', args);
+    };
+    console.error = (...args) => {
+        originalError(...args);
+        sendLogToServer('error', args);
+    };
+
     window.analyzer = new TargetImageAnalyzer();
     
     // Bind all Analyzer UI controls
@@ -5704,7 +6255,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // Exporters
     document.getElementById('analyzer-export-csv').addEventListener('click', () => window.analyzer.exportCSV());
     document.getElementById('analyzer-export-json').addEventListener('click', () => window.analyzer.exportJSON());
-    document.getElementById('analyzer-export-yolo').addEventListener('click', () => window.analyzer.exportYOLOAnnotations());
+    const yoloExportBtn = document.getElementById('analyzer-export-yolo');
+    if (yoloExportBtn) {
+        yoloExportBtn.addEventListener('click', () => window.analyzer.exportYOLOAnnotations());
+    }
     
     const hitlSaveBtn = document.getElementById('analyzer-save-hitl-main');
     if (hitlSaveBtn) {
@@ -5725,7 +6279,10 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('analyzer-export-pdf').addEventListener('click', () => window.analyzer.exportPDFCoachingReport());
 
     // Comparison actions
-    document.getElementById('run-comparison').addEventListener('click', () => window.analyzer.runComparison());
+    const runCompBtn = document.getElementById('run-comparison');
+    if (runCompBtn) {
+        runCompBtn.addEventListener('click', () => window.analyzer.runComparison());
+    }
 
     // Save Session btn
     const saveBtn = document.getElementById('save-session-btn');

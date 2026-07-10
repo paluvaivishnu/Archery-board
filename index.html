@@ -11,9 +11,9 @@
     <!-- FontAwesome for Premium Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <!-- Custom Stylesheet -->
-    <link rel="stylesheet" href="style.css?v=15">
+    <link rel="stylesheet" href="style.css?v=23">
 </head>
-<body class="dark-theme">
+<body class="light-theme">
     <div class="app-container">
         <!-- Header -->
         <header class="app-header">
@@ -32,12 +32,6 @@
                 </button>
                 <button class="tab-btn" data-tab="analyzer">
                     <i class="fa-solid fa-camera"></i> Photo Analyzer
-                </button>
-                <button class="tab-btn" data-tab="comparison">
-                    <i class="fa-solid fa-right-left"></i> Compare Sessions
-                </button>
-                <button class="tab-btn" data-tab="generator">
-                    <i class="fa-solid fa-cubes"></i> Dataset Generator
                 </button>
             </nav>
             <div class="header-actions">
@@ -200,12 +194,6 @@
                             </div>
 
 
-                            <div class="control-group" style="margin-bottom: 0.75rem;">
-                                <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; font-size: 0.8rem; user-select: none;">
-                                    <input type="checkbox" id="adjust-calibration-toggle" checked> Adjust Calibration Corners
-                                </label>
-                            </div>
-
                             <button id="analyze-target-btn" class="btn btn-primary btn-full" style="margin-top: 0.5rem;">
                                 <i class="fa-solid fa-bullseye"></i> Analyze & Detect Holes
                             </button>
@@ -222,31 +210,7 @@
 
 
 
-                        <div class="panel-section" id="confidence-section">
-                            <h3><i class="fa-solid fa-circle-check"></i> Analysis Confidence</h3>
-                            <div class="confidence-stats" style="font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-secondary); background: rgba(0,0,0,0.05); padding: 0.5rem; border-radius: var(--radius-sm); border: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 0.35rem;">
-                                <div style="display: flex; justify-content: space-between;">
-                                    <span>Target Board (CV):</span>
-                                    <span id="confidence-target" style="font-weight: bold; color: #9ca3af;">N/A</span>
-                                </div>
-                                <div style="display: flex; justify-content: space-between;">
-                                    <span>Perspective Warp:</span>
-                                    <span id="confidence-perspective" style="font-weight: bold; color: #9ca3af;">N/A</span>
-                                </div>
-                                <div style="display: flex; justify-content: space-between;">
-                                    <span>Holes (CV Contour):</span>
-                                    <span id="confidence-impact" style="font-weight: bold; color: #9ca3af;">N/A</span>
-                                </div>
-                                <div style="display: flex; justify-content: space-between;">
-                                    <span>Holes (YOLO):</span>
-                                    <span id="confidence-yolo" style="font-weight: bold; color: #9ca3af;">N/A</span>
-                                </div>
-                                <div style="display: flex; justify-content: space-between; border-top: 1px solid var(--border-color); padding-top: 0.25rem; margin-top: 0.25rem;">
-                                    <span>Combined Confidence:</span>
-                                    <span id="confidence-combined" style="font-weight: bold; color: #34d399;">N/A</span>
-                                </div>
-                            </div>
-                        </div>
+
 
                         <div class="panel-section" style="display: none;">
                             <h3><i class="fa-solid fa-rotate"></i> Replay & Sequence</h3>
@@ -262,50 +226,7 @@
                             </div>
                         </div>
 
-                        <div class="panel-section" id="developer-perf-section">
-                            <h3><i class="fa-solid fa-gauge-high"></i> Detection Benchmarks</h3>
-                            <div class="perf-stats" style="font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-secondary); background: rgba(0,0,0,0.05); padding: 0.5rem; border-radius: var(--radius-sm); border: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 0.25rem;">
-                                <div>Total Time: <span id="perf-total-time">0 ms</span></div>
-                                <div>Preprocessing: <span id="perf-preprocess-time">0 ms</span></div>
-                                <div>YOLO Inference: <span id="perf-yolo-time">0 ms</span></div>
-                                <div>OpenCV Core: <span id="perf-opencv-time">0 ms</span></div>
-                                <div>Render: <span id="perf-render-time">0 ms</span></div>
-                                <div>Detections: <span id="perf-shots-count">0</span></div>
-                                <div style="border-top: 1px solid rgba(52, 211, 153, 0.2); padding-top: 0.25rem; margin-top: 0.25rem; color: #60a5fa;">Model Version: <span id="perf-model-version">OpenCV / Configured YOLO</span></div>
-                            </div>
-                        </div>
-                    </div>
 
-                    <!-- Comparison Sidebar Content -->
-                    <div id="comparison-sidebar-content" style="display: none;">
-                        <div class="panel-section">
-                            <h3><i class="fa-solid fa-right-left"></i> Session Selection</h3>
-                            <div class="control-group">
-                                <label for="compare-session-a">Session A (Baseline)</label>
-                                <select id="compare-session-a">
-                                    <option value="">-- Select Session A --</option>
-                                    <!-- Loaded dynamically -->
-                                </select>
-                            </div>
-                            <div class="control-group">
-                                <label for="compare-session-b">Session B (Comparison)</label>
-                                <select id="compare-session-b">
-                                    <option value="">-- Select Session B --</option>
-                                    <!-- Loaded dynamically -->
-                                </select>
-                            </div>
-                            <button id="run-comparison" class="btn btn-primary btn-full" style="margin-top: 0.5rem;">
-                                <i class="fa-solid fa-chart-bar"></i> Compare Sessions
-                            </button>
-                        </div>
-                        
-                        <div class="panel-section" id="comparison-summary-sidebar" style="display: none;">
-                            <h3><i class="fa-solid fa-chart-pie"></i> Visual Analytics</h3>
-                            <div style="font-size: 0.75rem; color: var(--text-muted); line-height: 1.4;">
-                                Select two sessions to compute delta percentages and view comparative statistics.
-                            </div>
-                        </div>
-                    </div>
 
                 </div>
             </aside>
@@ -372,23 +293,7 @@
                     </div>
                 </div>
 
-                <!-- Comparison Viewport -->
-                <div class="canvas-viewport" id="viewport-comparison" style="display: none;">
-                    <div class="comparison-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; width: 100%; height: 100%; padding: 1rem; box-sizing: border-box;">
-                        <div class="comparison-pane" style="display: flex; flex-direction: column; gap: 0.5rem; height: 100%;">
-                            <h4 id="comparison-title-a" style="font-family: var(--font-title); font-size: 0.95rem; margin: 0; color: var(--accent);">Session A (Baseline)</h4>
-                            <div class="canvas-wrapper" style="flex: 1; display: flex; align-items: center; justify-content: center; background: var(--canvas-bg); border-radius: var(--radius-md); border: 1px solid var(--border-color); overflow: hidden;">
-                                <canvas id="comparison-canvas-a" width="450" height="450" style="max-width: 100%; max-height: 100%; object-fit: contain;"></canvas>
-                            </div>
-                        </div>
-                        <div class="comparison-pane" style="display: flex; flex-direction: column; gap: 0.5rem; height: 100%;">
-                            <h4 id="comparison-title-b" style="font-family: var(--font-title); font-size: 0.95rem; margin: 0; color: var(--accent);">Session B (Comparison)</h4>
-                            <div class="canvas-wrapper" style="flex: 1; display: flex; align-items: center; justify-content: center; background: var(--canvas-bg); border-radius: var(--radius-md); border: 1px solid var(--border-color); overflow: hidden;">
-                                <canvas id="comparison-canvas-b" width="450" height="450" style="max-width: 100%; max-height: 100%; object-fit: contain;"></canvas>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+
             </main>
 
             <!-- Right Panel: Shot History & Advanced Stats -->
@@ -409,18 +314,6 @@
                         <div class="stat-card">
                             <span class="stat-label">Average Score</span>
                             <span class="stat-value" id="stat-avg-score">0.00</span>
-                        </div>
-                        <div class="stat-card">
-                            <span class="stat-label">Extreme Spread</span>
-                            <span class="stat-value" id="stat-extreme-spread">0.0 px</span>
-                        </div>
-                        <div class="stat-card">
-                            <span class="stat-label">Mean Dist from Bullseye</span>
-                            <span class="stat-value" id="stat-mean-radius">0.0 px</span>
-                        </div>
-                        <div class="stat-card">
-                            <span class="stat-label">Offset from Center</span>
-                            <span class="stat-value" id="stat-windage">X: +0.0, Y: +0.0</span>
                         </div>
                     </div>
                 </div>
@@ -452,64 +345,6 @@
                     </div>
                 </div>
 
-                <!-- Analyzer Stats Summary Dashboard -->
-                <div class="panel-section" id="analyzer-stats-dashboard" style="display: none;">
-                    <div class="section-header-row">
-                        <h3><i class="fa-solid fa-chart-line"></i> Session Analysis</h3>
-                        <div class="confidence-reliability-gauge" id="analyzer-reliability-box" style="padding: 0.15rem 0.5rem; border-radius: var(--radius-sm); font-size: 0.65rem; font-weight: bold; background: rgba(16,185,129,0.15); color: #10b981;">
-                            Reliability: <span id="analyzer-reliability-val">100%</span>
-                        </div>
-                    </div>
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <span class="stat-label">Total Shots</span>
-                            <span class="stat-value" id="analyzer-stat-total-shots">0</span>
-                        </div>
-                        <div class="stat-card highlight">
-                            <span class="stat-label">Total Score</span>
-                            <span class="stat-value" id="analyzer-stat-total-score">0.00</span>
-                        </div>
-                        <div class="stat-card">
-                            <span class="stat-label">Average Score</span>
-                            <span class="stat-value" id="analyzer-stat-avg-score">0.00</span>
-                        </div>
-                        <div class="stat-card">
-                            <span class="stat-label">Extreme Spread</span>
-                            <span class="stat-value" id="analyzer-stat-extreme-spread">0.0 px</span>
-                        </div>
-                        <div class="stat-card">
-                            <span class="stat-label">Mean Radius</span>
-                            <span class="stat-value" id="analyzer-stat-mean-radius">0.0 px</span>
-                        </div>
-                        <div class="stat-card">
-                            <span class="stat-label">CEP (50% Group)</span>
-                            <span class="stat-value" id="analyzer-stat-cep">0.0 px</span>
-                        </div>
-                        <div class="stat-card">
-                            <span class="stat-label">Windage Offset</span>
-                            <span class="stat-value" id="analyzer-stat-windage">X: +0.0</span>
-                        </div>
-                        <div class="stat-card">
-                            <span class="stat-label">Elevation Offset</span>
-                            <span class="stat-value" id="analyzer-stat-elevation">Y: +0.0</span>
-                        </div>
-                        <div class="stat-card">
-                            <span class="stat-label">Min/Max Score</span>
-                            <span class="stat-value" id="analyzer-stat-minmax">0.0 - 0.0</span>
-                        </div>
-                    </div>
-
-                    <!-- AI recommendation engine feedback -->
-                    <div class="coaching-feedback-box" id="coaching-box" style="margin-top: 1rem; padding: 0.75rem; background: rgba(59,130,246,0.08); border-left: 3px solid var(--accent); border-radius: var(--radius-sm); font-size: 0.75rem; line-height: 1.45;">
-                        <h4 style="font-family: var(--font-title); font-weight: 600; font-size: 0.8rem; margin: 0 0 0.35rem 0; color: var(--accent); display: flex; align-items: center; gap: 0.35rem;">
-                            <i class="fa-solid fa-lightbulb"></i> AI Coaching Analysis
-                        </h4>
-                        <div id="coaching-text" style="color: var(--text-secondary);">
-                            Upload a target image to generate automated posture, breath control, and sight correction recommendations.
-                        </div>
-                    </div>
-                </div>
-
                 <!-- Analyzer History Table -->
                 <div class="panel-section history-section" id="analyzer-history-section" style="display: none;">
                     <div class="section-header-row">
@@ -518,12 +353,7 @@
                             <button id="analyzer-export-csv" class="text-btn" title="Export CSV"><i class="fa-solid fa-file-csv"></i> CSV</button>
                             <button id="analyzer-export-json" class="text-btn" title="Export JSON"><i class="fa-solid fa-file-code"></i> JSON</button>
                             <button id="analyzer-export-pdf" class="text-btn" title="Export PDF Coaching Report" style="background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);"><i class="fa-solid fa-file-pdf"></i> PDF</button>
-                            <button id="analyzer-export-yolo" class="text-btn" title="Export YOLO Dataset Archive" style="background: rgba(16, 185, 129, 0.1); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.2);"><i class="fa-solid fa-images"></i> YOLO</button>
-                        </div>
-                        <div style="margin-top: 0.5rem; width: 100%;">
-                            <button id="analyzer-save-hitl-right" class="btn btn-primary btn-full" style="background: rgba(59, 130, 246, 0.1); color: #3b82f6; border: 1px solid rgba(59, 130, 246, 0.3); font-weight: bold; width: 100%;">
-                                <i class="fa-solid fa-floppy-disk"></i> Save Manual Corrections
-                            </button>
+                            <button id="analyzer-save-hitl-right" class="text-btn" title="Save Manual Corrections" style="background: rgba(59, 130, 246, 0.1); color: #3b82f6; border: 1px solid rgba(59, 130, 246, 0.2); font-weight: bold;"><i class="fa-solid fa-floppy-disk"></i> Save Edits</button>
                         </div>
                     </div>
                     
@@ -561,146 +391,47 @@
                     </div>
                 </div>
 
-                <!-- Comparison Dashboard -->
-                <div class="panel-section" id="comparison-stats-dashboard" style="display: none;">
-                    <h3><i class="fa-solid fa-right-left"></i> Session Comparison</h3>
-                    
-                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.5rem; text-align: center; font-size: 0.7rem; border-bottom: 1px dashed var(--border-color); padding-bottom: 0.5rem; margin-bottom: 0.75rem;">
-                        <strong>Metric</strong>
-                        <strong id="comp-header-a">Session A</strong>
-                        <strong id="comp-header-b">Session B</strong>
+                <!-- Analyzer Stats Summary Dashboard -->
+                <div class="panel-section" id="analyzer-stats-dashboard" style="display: none;">
+                    <div class="section-header-row">
+                        <h3><i class="fa-solid fa-chart-line"></i> Session Analysis</h3>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <span class="stat-label">Total Shots</span>
+                            <span class="stat-value" id="analyzer-stat-total-shots">0</span>
+                        </div>
+                        <div class="stat-card highlight">
+                            <span class="stat-label">Total Score</span>
+                            <span class="stat-value" id="analyzer-stat-total-score">0.00</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Average Score</span>
+                            <span class="stat-value" id="analyzer-stat-avg-score">0.00</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Min/Max Score</span>
+                            <span class="stat-value" id="analyzer-stat-minmax">0.0 - 0.0</span>
+                        </div>
                     </div>
 
-                    <div id="comparison-rows" style="display: flex; flex-direction: column; gap: 0.5rem; font-size: 0.75rem; border-bottom: 1px dashed var(--border-color); padding-bottom: 0.75rem;">
-                        <!-- Dynamic rows comparing: Total Score, Avg Score, Mean Radius, Extreme Spread, CEP, Windage/Elevation offset -->
-                    </div>
-
-                    <div style="margin-top: 1rem;">
-                        <h4 style="font-family: var(--font-title); font-size: 0.8rem; margin: 0 0 0.5rem 0;"><i class="fa-solid fa-chart-line"></i> Improvement Delta</h4>
-                        <div style="display: flex; align-items: center; justify-content: center; background: var(--canvas-bg); border-radius: var(--radius-md); border: 1px solid var(--border-color); padding: 0.5rem; box-sizing: border-box; height: 140px;">
-                            <canvas id="comparison-chart" width="300" height="120" style="width: 100%; height: 100%;"></canvas>
+                    <!-- AI recommendation engine feedback -->
+                    <div class="coaching-feedback-box" id="coaching-box" style="margin-top: 1rem; padding: 0.75rem; background: rgba(59,130,246,0.08); border-left: 3px solid var(--accent); border-radius: var(--radius-sm); font-size: 0.75rem; line-height: 1.45;">
+                        <h4 style="font-family: var(--font-title); font-weight: 600; font-size: 0.8rem; margin: 0 0 0.35rem 0; color: var(--accent); display: flex; align-items: center; gap: 0.35rem;">
+                            <i class="fa-solid fa-lightbulb"></i> AI Coaching Analysis
+                        </h4>
+                        <div id="coaching-text" style="color: var(--text-secondary);">
+                            Upload a target image to generate automated posture, breath control, and sight correction recommendations.
                         </div>
                     </div>
                 </div>
+
+                <!-- Comparison Dashboard -->
+
             </section>
         </div>
 
-        <!-- Generator Overlay Modal -->
-        <div id="generator-modal" class="generator-overlay" style="display: none;">
-            <div class="generator-container">
-                <header class="generator-header">
-                    <h2><i class="fa-solid fa-cubes"></i> ML Dataset & YOLO Annotation Generator</h2>
-                    <button class="close-generator-btn"><i class="fa-solid fa-xmark"></i></button>
-                </header>
-                <div class="generator-body">
-                    <div class="generator-settings">
-                        <h3>Dataset Parameters</h3>
-                        
-                        <div class="control-group">
-                            <label for="gen-images-count">Number of Target Images</label>
-                            <input type="number" id="gen-images-count" min="1" max="100" value="10">
-                        </div>
-                        
-                        <div class="control-group">
-                            <label for="gen-shots-per-target">Shots Per Target</label>
-                            <div class="range-container">
-                                <input type="range" id="gen-shots-per-target" min="0" max="15" value="5" step="1">
-                                <span class="value-display" id="gen-shots-val">5</span>
-                            </div>
-                        </div>
 
-                        <div class="control-group">
-                            <label for="gen-noise">Image Visual Noise</label>
-                            <select id="gen-noise">
-                                <option value="clean" selected>Clean (Vector)</option>
-                                <option value="low">Low (Light grain)</option>
-                                <option value="medium">Medium (Paper texture)</option>
-                                <option value="high">High (Outdoor/Noisy)</option>
-                            </select>
-                        </div>
-
-                        <div class="control-group">
-                            <label for="gen-distortion">Perspective / Rotation Distortions</label>
-                            <select id="gen-distortion">
-                                <option value="none" selected>None (Perfect flat)</option>
-                                <option value="mild">Mild (Rotated & slight skew)</option>
-                                <option value="heavy">Heavy (Severe camera perspective skew)</option>
-                            </select>
-                        </div>
-
-                        <div class="control-group">
-                            <label for="gen-impact-type">Synthetic Projectile Class</label>
-                            <select id="gen-impact-type">
-                                <option value="mixed" selected>Mixed (Randomized Gunshot Classes)</option>
-                                <option value="bullet_9mm">Class 0: 9mm Bullet Hole (9.0mm)</option>
-                                <option value="bullet_45acp">Class 1: .45 ACP Bullet Hole (11.5mm)</option>
-                                <option value="bullet_22lr">Class 2: .22 LR Bullet Hole (5.6mm)</option>
-                                <option value="shotgun_pellet">Class 3: Shotgun Pellet (2.0mm)</option>
-                            </select>
-                        </div>
-
-                        <div class="control-group toggle-group" style="margin-top: 0.5rem; margin-bottom: 0.5rem;">
-                            <label for="gen-include-bullseye">Include Bullseye Center (Class 4)</label>
-                            <label class="switch">
-                                <input type="checkbox" id="gen-include-bullseye" checked>
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-
-                        <div class="control-group toggle-group" style="margin-top: 1rem;">
-                            <label for="gen-yolo-draw">Draw Bounding Boxes on Target</label>
-                            <label class="switch">
-                                <input type="checkbox" id="gen-yolo-draw" checked>
-                                <span class="slider"></span>
-                            </label>
-                        </div>
-
-                        <button id="run-generator" class="btn btn-primary btn-full" style="margin-top: 1.5rem;">
-                            <i class="fa-solid fa-play"></i> Generate Synthetic Dataset
-                        </button>
-
-                        <div id="dataset-assistant-panel" style="margin-top: 1rem; padding: 0.75rem; background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); border-radius: var(--radius-md); font-size: 0.7rem;">
-                            <h4 style="font-family: var(--font-title); color: var(--accent); margin: 0 0 0.5rem 0;"><i class="fa-solid fa-graduation-cap"></i> Training Dataset Assistant</h4>
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; color: var(--text-secondary); line-height: 1.4;">
-                                <div>Format: <strong>YOLO11 Ready</strong></div>
-                                <div>Images Size: <strong>900x900px</strong></div>
-                                <div>Target Splits: <strong>100% Train</strong></div>
-                                <div>Metadata File: <strong>data.yaml</strong></div>
-                            </div>
-                            <div style="border-top: 1px solid var(--border-color); margin-top: 0.5rem; padding-top: 0.5rem;">
-                                <strong style="color: var(--text-primary);">Label Class Mapping:</strong>
-                                <ul style="padding-left: 1rem; margin: 0.25rem 0 0 0; color: var(--text-muted); list-style-type: decimal;">
-                                    <li>bullet-hole (Class 0)</li>
-                                    <li>pellet-hole (Class 1)</li>
-                                    <li>arrow-impact (Class 2)</li>
-                                    <li>dart-impact (Class 3)</li>
-                                    <li>bullseye-center (Class 4)</li>
-                                </ul>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="generator-preview">
-                        <h3>Dataset Preview</h3>
-                        <div class="preview-carousel-wrapper">
-                            <div class="preview-card">
-                                <canvas id="gen-preview-canvas" width="450" height="450"></canvas>
-                                <div class="yolo-code-box">
-                                    <h4>YOLO Annotations (target_001.txt)</h4>
-                                    <pre><code id="yolo-annotations-preview">// Click Generate to preview YOLO class files...
-// Format: &lt;class_id&gt; &lt;x_center&gt; &lt;y_center&gt; &lt;width&gt; &lt;height&gt;</code></pre>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="generator-actions">
-                            <button id="download-dataset" class="btn btn-success btn-full" disabled>
-                                <i class="fa-solid fa-file-zipper"></i> Download Dataset (ZIP)
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
 
     </div>
 
@@ -716,10 +447,10 @@
     <!-- External JS libraries -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     
-    <!-- Local Application Scripts -->
-    <script src="sound_effects.js?v=17"></script>
-    <script src="dataset_generator.js?v=17"></script>
-    <script src="image_analyzer.js?v=20"></script>
-    <script src="app.js?v=17"></script>
+    <!-- Load main application logic -->
+    <script src="sound_effects.js?v=23"></script>
+    <script src="dataset_generator.js?v=23"></script>
+    <script src="image_analyzer.js?v=23"></script>
+    <script src="app.js?v=23"></script>
 </body>
 </html>
