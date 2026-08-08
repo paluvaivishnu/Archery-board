@@ -6,7 +6,7 @@ Bullseye AI is a modern, interactive, browser-based precision target scoring app
 
 ## 🎯 What Is It?
 
-At its core, Bullseye AI is a zero-dependency web application that serves two primary functions:
+At its core, Bullseye AI is a client-server web application with a Python FastAPI backend that serves two primary functions:
 1. **Interactive Target Simulator**: A training and analysis tool where users can simulate shots, visualize impact coordinates, and calculate precise scores with real-time statistical metrics.
 2. **ML Dataset Generator**: A synthetic data generator that creates thousands of target images with randomized bullet holes and annotations (in YOLO format) to train machine vision models for target recognition.
 
@@ -47,24 +47,44 @@ At its core, Bullseye AI is a zero-dependency web application that serves two pr
 
 ## 📂 Project Architecture
 
-The application has been simplified into a clean, static, client-side directory structure:
+The application features a modern client-server architecture:
 
+### Frontend
 * **index.html**: The main web interface containing the simulator canvas, control sidebars, statistics panels, and the dataset generator modal.
 * **style.css**: Custom modern styling rules including dark mode layouts, glassmorphism, responsive grids, and animation variables.
 * **app.js**: The core application logic managing coordinates, scoring math, stats calculation, canvas rendering, magnifier lens, and file exporters.
+* **api_client.js**: Connects the frontend UI to the backend scoring API endpoints.
 * **dataset_generator.js**: Logic for rendering synthetic target frames, distorting coordinates, formatting YOLO text structures, and compiling them into packages.
 * **sound_effects.js**: An audio synthesizer module that generates custom physical impact sound waves programmatically.
-* **test.html**: An automated testing suite containing 50 specific cases to verify target coordinates, scoring ring boundaries, and decimal precision math.
-* **run.sh**: A simple startup script that runs Python's built-in, lightweight web server.
+
+### Backend
+* **backend/src/api/**: The FastAPI REST API that processes images and returns scoring data.
+* **backend/src/detection/**: Integration with YOLOv11 and PyTorch for accurate bounding box detection.
+* **backend/src/scoring/**: OpenCV-based classical algorithms to precisely calibrate the target board and score the bullet holes accurately.
 
 ---
 
 ## 🛠️ How To Run
 
-1. Open your terminal in the project directory.
-2. Run the shell script:
+### 1. Start the Backend API
+1. Open your terminal and navigate to the backend directory:
+   ```bash
+   cd backend
+   ```
+2. Install the required dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Run the FastAPI server:
+   ```bash
+   python run.py
+   ```
+   The backend will start at **http://localhost:8000**.
+
+### 2. Start the Frontend Web App
+1. In a new terminal, run the shell script from the project root:
    ```bash
    ./run.sh
    ```
-3. Open your browser and navigate to **http://localhost:8000**.
-4. (Optional) To run coordinate math unit tests, open **test.html** directly in your browser.
+2. Open your browser and navigate to the frontend URL (usually **http://localhost:8000** or the port specified by the python HTTP server).
+3. (Optional) To run coordinate math unit tests, open **test.html** directly in your browser.
