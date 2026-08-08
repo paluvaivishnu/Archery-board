@@ -203,42 +203,52 @@ class BullseyeApp {
             btn.classList.toggle('active', btn.getAttribute('data-tab') === tab);
         });
 
+        const hideElement = (id) => {
+            const el = document.getElementById(id);
+            if (el) el.style.display = 'none';
+        };
+
         // Hide all sidebars, viewports, and stats dashboards
-        document.getElementById('simulator-sidebar-content').style.display = 'none';
-        document.getElementById('analyzer-sidebar-content').style.display = 'none';
-        document.getElementById('comparison-sidebar-content').style.display = 'none';
+        hideElement('simulator-sidebar-content');
+        hideElement('analyzer-sidebar-content');
+        hideElement('comparison-sidebar-content');
 
-        document.getElementById('viewport-simulator').style.display = 'none';
-        document.getElementById('viewport-analyzer').style.display = 'none';
-        document.getElementById('viewport-comparison').style.display = 'none';
+        hideElement('viewport-simulator');
+        hideElement('viewport-analyzer');
+        hideElement('viewport-comparison');
 
-        document.getElementById('simulator-stats-dashboard').style.display = 'none';
-        document.getElementById('simulator-history-section').style.display = 'none';
-        document.getElementById('analyzer-stats-dashboard').style.display = 'none';
-        document.getElementById('analyzer-history-section').style.display = 'none';
-        document.getElementById('comparison-stats-dashboard').style.display = 'none';
+        hideElement('simulator-stats-dashboard');
+        hideElement('simulator-history-section');
+        hideElement('analyzer-stats-dashboard');
+        hideElement('analyzer-history-section');
+        hideElement('comparison-stats-dashboard');
 
         // Show the selected mode components
+        const showElement = (id, displayStyle = 'block') => {
+            const el = document.getElementById(id);
+            if (el) el.style.display = displayStyle;
+        };
+
         if (tab === 'simulator') {
-            document.getElementById('simulator-sidebar-content').style.display = 'flex';
-            document.getElementById('viewport-simulator').style.display = 'block';
-            document.getElementById('simulator-stats-dashboard').style.display = 'block';
-            document.getElementById('simulator-history-section').style.display = 'block';
+            showElement('simulator-sidebar-content', 'flex');
+            showElement('viewport-simulator', 'block');
+            showElement('simulator-stats-dashboard', 'block');
+            showElement('simulator-history-section', 'block');
             this.renderTarget();
         } else if (tab === 'analyzer') {
-            document.getElementById('analyzer-sidebar-content').style.display = 'flex';
-            document.getElementById('viewport-analyzer').style.display = 'block';
-            document.getElementById('analyzer-stats-dashboard').style.display = 'block';
-            document.getElementById('analyzer-history-section').style.display = 'block';
+            showElement('analyzer-sidebar-content', 'flex');
+            showElement('viewport-analyzer', 'block');
+            showElement('analyzer-stats-dashboard', 'block');
+            showElement('analyzer-history-section', 'block');
             
             // Initialize analyzer if not already done
             if (window.analyzer && typeof window.analyzer.activate === 'function') {
                 window.analyzer.activate();
             }
         } else if (tab === 'comparison') {
-            document.getElementById('comparison-sidebar-content').style.display = 'flex';
-            document.getElementById('viewport-comparison').style.display = 'block';
-            document.getElementById('comparison-stats-dashboard').style.display = 'block';
+            showElement('comparison-sidebar-content', 'flex');
+            showElement('viewport-comparison', 'block');
+            showElement('comparison-stats-dashboard', 'block');
             
             // Refresh sessions dropdown
             if (window.analyzer && typeof window.analyzer.populateComparisonDropdowns === 'function') {
@@ -368,7 +378,7 @@ class BullseyeApp {
             this.ctx.fill();
 
             // Shot index tag with score
-            this.ctx.font = 'bold 9px var(--font-mono)';
+            this.ctx.font = 'bold 13px var(--font-mono)';
             this.ctx.fillStyle = '#ffffff';
             this.ctx.textAlign = 'center';
             this.ctx.textBaseline = 'middle';
@@ -592,13 +602,6 @@ class BullseyeApp {
         document.getElementById('stat-total-shots').textContent = totalShots;
         document.getElementById('stat-total-score').textContent = totalScore.toFixed(2);
         document.getElementById('stat-avg-score').textContent = avgScore.toFixed(2);
-        document.getElementById('stat-extreme-spread').textContent = extremeSpread.toFixed(1) + ' ' + this.unitName;
-        document.getElementById('stat-mean-radius').textContent = meanRadius.toFixed(1) + ' ' + this.unitName;
-        
-        const windageVal = document.getElementById('stat-windage');
-        const windXSymbol = avgX >= 0 ? '+' : '';
-        const windYSymbol = avgY >= 0 ? '+' : '';
-        windageVal.textContent = `X: ${windXSymbol}${(avgX * this.unitScale).toFixed(1)}, Y: ${windYSymbol}${(avgY * this.unitScale).toFixed(1)} ${this.unitName}`;
     }
 
     renderShotLog() {

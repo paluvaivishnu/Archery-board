@@ -252,6 +252,9 @@
                     </div>
                 </div>
 
+                <!-- API Client for Backend Scoring -->
+                <script src="api_client.js"></script>
+
                 <!-- Analyzer Viewport -->
                 <div class="canvas-viewport" id="viewport-analyzer" style="display: none;">
                     <div class="canvas-wrapper" id="analyzer-canvas-container" style="position: relative;">
@@ -450,6 +453,8 @@
     <!-- Load main application logic -->
     <script src="sound_effects.js?v=23"></script>
     <script src="dataset_generator.js?v=23"></script>
+        
+        <!-- We no longer need OpenCV or ONNX locally, the backend handles it! -->
     <script src="image_analyzer.js?v=23"></script>
     <script src="app.js?v=23"></script>
 </body>

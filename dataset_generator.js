@@ -6,7 +6,7 @@ class DatasetGenerator {
     constructor() {
         this.zip = null;
         this.previewCanvas = document.getElementById('gen-preview-canvas');
-        this.previewCtx = this.previewCanvas.getContext('2d');
+        this.previewCtx = this.previewCanvas ? this.previewCanvas.getContext('2d') : null;
         
         this.initializeEvents();
     }

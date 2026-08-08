@@ -1,21 +1,35 @@
 #!/bin/bash
 
-# Find and kill any existing process running on port 8000
-PID_8000=$(lsof -t -i:8000)
-if [ ! -z "$PID_8000" ]; then
-    echo "Port 8000 is already in use by process(es): $PID_8000. Terminating..."
-    kill -9 $PID_8000 2>/dev/null
-fi
+# Archery Board - Hybrid Run Script
+# Starts both the FastAPI backend and the static frontend server
 
-echo "Starting Bullseye AI Server on port 8000..."
+echo "🏹 Starting Archery Board (Hybrid Mode)..."
+
+# Navigate to script directory
+cd "$(dirname "$0")"
+
+# Start the Python FastAPI backend in the background
+echo "🚀 Starting FastAPI Backend (Port 8000)..."
+cd backend
+python3 -m uvicorn src.api.app:app --host 127.0.0.1 --port 8000 --reload &
+BACKEND_PID=$!
+cd ..
+
+# Start the static frontend server
+echo "🌐 Starting Frontend Server (Port 8080)..."
+python3 -m http.server 8080 &
+FRONTEND_PID=$!
+
 echo ""
-echo "============================================="
-echo "🎯 Bullseye AI is now running!"
-echo "👉 Web App & API: http://localhost:8000"
-echo "============================================="
-echo "Press Ctrl+C to stop the server."
+echo "✅ Archery Board is running!"
+echo "👉 Frontend: http://localhost:8080"
+echo "👉 Backend API: http://localhost:8000"
 echo ""
+echo "Press Ctrl+C to stop both servers."
 
-# Start standard python http server with registered MIME types for WASM/ONNX
-python3 -c "import http.server, socketserver; Handler = http.server.SimpleHTTPRequestHandler; Handler.extensions_map.update({'.wasm': 'application/wasm', '.onnx': 'application/octet-stream', '.mjs': 'application/javascript'}); socketserver.TCPServer(('', 8000), Handler).serve_forever()"
+# Trap Ctrl+C to kill both background processes
+trap "echo 'Stopping servers...'; kill $BACKEND_PID; kill $FRONTEND_PID; exit" INT TERM
 
+# Keep script running
+wait $BACKEND_PID
+wait $FRONTEND_PID
