@@ -9,20 +9,20 @@ Archery Board is an AI-powered web application for scoring archery and shooting 
 - **Real-Time Scoring:** Calculates exact scores down to the decimal using standard target dimensions (e.g. ISSF 10m Air Pistol).
 
 ## How to Run
-### 1. Start the Backend API
+The project includes a unified run script that starts both the backend API and the frontend web server simultaneously.
+
+1. Install the backend dependencies (first time only):
 ```bash
 cd backend
 pip install -r requirements.txt
-python run.py
+cd ..
 ```
-This will start the FastAPI server on `http://localhost:8000`.
 
-### 2. Start the Frontend
-In a new terminal window, serve the frontend from the project root:
+2. Run the startup script from the project root:
 ```bash
 ./run.sh
 ```
-Or simply open `index.html` directly in your browser.
+This will automatically start the Backend API on `http://localhost:8000` and the Frontend Web Interface on `http://localhost:8080`.
 
 ## How to Use
 1. Make sure both the backend and frontend are running.

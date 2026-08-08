@@ -66,25 +66,25 @@ The application features a modern client-server architecture:
 
 ## 🛠️ How To Run
 
-### 1. Start the Backend API
+The project includes a unified shell script that starts both the backend API and the frontend web server concurrently.
+
+### 1. Install Dependencies (First time only)
 1. Open your terminal and navigate to the backend directory:
    ```bash
    cd backend
    ```
-2. Install the required dependencies:
+2. Install the required Python packages:
    ```bash
    pip install -r requirements.txt
+   cd ..
    ```
-3. Run the FastAPI server:
-   ```bash
-   python run.py
-   ```
-   The backend will start at **http://localhost:8000**.
 
-### 2. Start the Frontend Web App
-1. In a new terminal, run the shell script from the project root:
+### 2. Start Both Servers
+1. From the project root, run the startup script:
    ```bash
    ./run.sh
    ```
-2. Open your browser and navigate to the frontend URL (usually **http://localhost:8000** or the port specified by the python HTTP server).
+   *This will automatically launch the Backend API on **http://localhost:8000** and the Frontend Web App on **http://localhost:8080**.*
+
+2. Open your browser and navigate to **http://localhost:8080**.
 3. (Optional) To run coordinate math unit tests, open **test.html** directly in your browser.
