@@ -1,6 +1,22 @@
+# Node
 node_modules/
-.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# Logs & Output
 *.log
 runs/
+
+# ML Models
 *.pt
 *.onnx
+
+# OS Files
+.DS_Store
